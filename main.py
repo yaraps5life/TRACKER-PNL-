@@ -61,6 +61,7 @@ def get_current_user_id(authorization: str = Header(...)) -> int:
     if user_data is None:
         raise HTTPException(status_code=401, detail="Подпись Telegram недействительна")
 
+    print(f"[DEBUG] Авторизован user_id={user_data['id']}, name={user_data.get('first_name')}")
     return user_data["id"]
 
 
