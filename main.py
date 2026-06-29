@@ -41,7 +41,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Trade, UserSettings
+from models import Base, Trade, UserSettings, FavoriteSymbol
 from telegram_auth import validate_telegram_init_data
 
 # Создаём таблицы в базе при первом запуске (если их ещё нет)
@@ -464,6 +464,88 @@ def get_tags(
     return {"tags": sorted(unique_tags)}
 
 
+# ---------- Избранные тикеры ----------
+
+DEFAULT_FAVORITE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSD", "EURUSD", "GBPUSD"]
+
+
+@app.get("/favorites")
+def get_favorites(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Список избранных тикеров для выпадающего списка "Актив".
+    Если у юзера ещё нет ни одного избранного — отдаём дефолтный набор
+    (но НЕ сохраняем его в базу, пока юзер сам что-то не добавит/уберёт —
+    иначе у каждого нового юзера будет 5 "призрачных" записей в БД)."""
+    favorites = db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).order_by(FavoriteSymbol.created_at).all()
+
+    if not favorites:
+        return {"symbols": DEFAULT_FAVORITE_SYMBOLS, "is_default": True}
+
+    return {"symbols": [f.symbol for f in favorites], "is_default": False}
+
+
+@app.post("/favorites/{symbol}")
+def add_favorite(
+    symbol: str,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Добавить тикер в избранное. Если у юзера до этого был только
+    дефолтный набор (ничего не сохранено в БД) — сначала материализуем
+    дефолтный набор в базу, чтобы новый тикер встал рядом с ним, а не заменил его."""
+    symbol = symbol.strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Тикер не может быть пустым")
+
+    existing = db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).all()
+
+    if not existing:
+        # Материализуем дефолтный набор, чтобы он не потерялся
+        for default_symbol in DEFAULT_FAVORITE_SYMBOLS:
+            db.add(FavoriteSymbol(user_id=user_id, symbol=default_symbol))
+        existing_symbols = set(DEFAULT_FAVORITE_SYMBOLS)
+    else:
+        existing_symbols = {f.symbol for f in existing}
+
+    if symbol not in existing_symbols:
+        db.add(FavoriteSymbol(user_id=user_id, symbol=symbol))
+
+    db.commit()
+
+    favorites = db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).order_by(FavoriteSymbol.created_at).all()
+    return {"symbols": [f.symbol for f in favorites]}
+
+
+@app.delete("/favorites/{symbol}")
+def remove_favorite(
+    symbol: str,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Убрать тикер из избранного. Если у юзера был только дефолтный набор —
+    материализуем его минус удаляемый тикер, чтобы убрать именно этот тикер,
+    а не просто остаться с пустым избранным (что вернуло бы дефолт снова)."""
+    symbol = symbol.strip().upper()
+
+    existing = db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).all()
+
+    if not existing:
+        for default_symbol in DEFAULT_FAVORITE_SYMBOLS:
+            if default_symbol != symbol:
+                db.add(FavoriteSymbol(user_id=user_id, symbol=default_symbol))
+    else:
+        db.query(FavoriteSymbol).filter(
+            FavoriteSymbol.user_id == user_id, FavoriteSymbol.symbol == symbol
+        ).delete()
+
+    db.commit()
+
+    favorites = db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).order_by(FavoriteSymbol.created_at).all()
+    return {"symbols": [f.symbol for f in favorites]}
+
+
 # ---------- Удаление всех данных ----------
 
 @app.delete("/account/data")
@@ -471,10 +553,11 @@ def delete_all_data(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Полный сброс: удаляет ВСЕ сделки пользователя и сбрасывает
-    стартовый баланс обратно в 0. Безвозвратно — подтверждение должно
-    быть запрошено на фронтенде ДО вызова этого эндпоинта."""
+    """Полный сброс: удаляет ВСЕ сделки, избранные тикеры пользователя
+    и сбрасывает стартовый баланс обратно в 0. Безвозвратно — подтверждение
+    должно быть запрошено на фронтенде ДО вызова этого эндпоинта."""
     deleted_trades = db.query(Trade).filter(Trade.user_id == user_id).delete()
+    db.query(FavoriteSymbol).filter(FavoriteSymbol.user_id == user_id).delete()
 
     settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
     if settings:
