@@ -1,19 +1,26 @@
 """
-Бэкенд журнала сделок v3 — с авторизацией через Telegram и PostgreSQL.
+Бэкенд журнала сделок v4 — с авторизацией через Telegram и PostgreSQL.
 
 Каждый запрос должен содержать заголовок
 "Authorization: tma <init_data>" — это подпись Telegram,
 из которой сервер достаёт user_id и работает ТОЛЬКО с данными этого юзера.
 
-Новое в v3 — эндпоинты под полноценный UI (дашборд/журнал/деталь/аналитика):
-  GET  /stats/summary       — сводка для дашборда (PnL, винрейт, equity curve)
-  GET  /trades              — список сделок с фильтрами (журнал)
-  GET  /trades/{trade_id}   — одна сделка (деталь)
-  PATCH /trades/{trade_id}  — обновить заметку/теги
-  DELETE /trades/{trade_id} — удалить сделку
-  POST /trades              — добавить сделку вручную
-  GET  /stats/by-tag        — PnL по тегам/сетапам (аналитика)
-  GET  /tags                — список всех тегов пользователя
+Логика баланса: пользователь один раз задаёт стартовый баланс счёта
+(GET/POST /settings), а текущий баланс на дашборде считается как
+starting_balance + сумма pnl_usd всех сделок. % прибыли считается
+от стартового баланса.
+
+Эндпоинты:
+  GET  /settings             — получить стартовый баланс
+  POST /settings             — задать/изменить стартовый баланс
+  GET  /stats/summary        — сводка для дашборда (баланс $, % прибыли, график баланса)
+  GET  /trades               — список сделок с фильтрами (журнал)
+  GET  /trades/{trade_id}    — одна сделка (деталь)
+  PATCH /trades/{trade_id}   — обновить заметку/теги
+  DELETE /trades/{trade_id}  — удалить сделку
+  POST /trades               — добавить сделку вручную
+  GET  /stats/by-tag         — PnL по тегам/сетапам (аналитика)
+  GET  /tags                 — список всех тегов пользователя
 
 Как запустить локально:
    pip install fastapi uvicorn sqlalchemy psycopg2-binary --break-system-packages
@@ -32,7 +39,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Trade
+from models import Base, Trade, UserSettings
 from telegram_auth import validate_telegram_init_data
 
 # Создаём таблицы в базе при первом запуске (если их ещё нет)
@@ -57,17 +64,20 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_СВО
 class NewTrade(BaseModel):
     asset: str
     direction: Literal["long", "short"]
-    risk_percent: float
-    result_r: float
+    result_r: Optional[float] = None       # Risk Reward — только для статистики
+    pnl_usd: Optional[float] = None        # двигает баланс счёта
+    note: Optional[str] = None
+    trade_date: Optional[datetime] = None  # дата сделки, не обязательна
+    tags: Optional[list[str]] = None
+    source: Literal["manual", "auto"] = "manual"
+
+    # поля под будущую авто-синхронизацию — не из формы, но поддерживаются API
     symbol: Optional[str] = None
     entry_price: Optional[float] = None
     exit_price: Optional[float] = None
     size: Optional[float] = None
     leverage: Optional[float] = None
-    pnl_usd: Optional[float] = None
-    source: Literal["manual", "auto"] = "manual"
-    note: Optional[str] = None
-    tags: Optional[list[str]] = None
+    risk_percent: Optional[float] = None
     opened_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
 
@@ -76,6 +86,10 @@ class UpdateTrade(BaseModel):
     """Для PATCH — обычно меняют только заметку и теги уже импортированной сделки."""
     note: Optional[str] = None
     tags: Optional[list[str]] = None
+
+
+class SettingsUpdate(BaseModel):
+    starting_balance: float
 
 
 # ---------- Авторизация ----------
@@ -98,49 +112,81 @@ def get_current_user_id(authorization: str = Header(...)) -> int:
     return user_data["id"]
 
 
-# ---------- Расчёт статистики (R-based, как в v1/v2) ----------
+# ---------- Настройки пользователя (стартовый баланс) ----------
 
-def calculate_stats(trades: list[Trade]) -> dict:
-    """Винрейт/profit factor/streak/equity curve по R-мультипликаторам —
-    это и есть твоя основная метрика по ICT/SMT методологии."""
+def get_or_create_settings(user_id: int, db: Session) -> UserSettings:
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    if not settings:
+        settings = UserSettings(user_id=user_id, starting_balance=0.0)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+
+# ---------- Расчёт статистики (баланс счёта в $, % прибыли) ----------
+
+def calculate_stats(trades: list[Trade], starting_balance: float) -> dict:
+    """
+    Главная логика дашборда:
+    - current_balance = starting_balance + сумма pnl_usd всех сделок
+    - pnl_pct = процент прибыли от starting_balance
+    - balance_curve = история баланса по каждой сделке (для графика) —
+      считается в хронологическом порядке (trades должны быть отсортированы по дате)
+    Winrate/profit factor считаются по pnl_usd, где он указан; если pnl_usd
+    не указан у сделки — она не участвует в этих метриках (но участвует в R-статистике).
+    """
     if not trades:
         return {
             "total_trades": 0, "winrate": 0, "profit_factor": 0,
-            "total_r": 0, "current_streak": 0, "equity_curve": [],
-            "pnl_usd_total": 0,
+            "total_r": 0, "current_streak": 0,
+            "starting_balance": round(starting_balance, 2),
+            "current_balance": round(starting_balance, 2),
+            "pnl_total": 0, "pnl_pct": 0,
+            "balance_curve": [round(starting_balance, 2)],
         }
 
-    wins = [t.result_r for t in trades if t.result_r > 0]
-    losses = [t.result_r for t in trades if t.result_r < 0]
+    trades_with_pnl = [t for t in trades if t.pnl_usd is not None]
+    wins = [t.pnl_usd for t in trades_with_pnl if t.pnl_usd > 0]
+    losses = [t.pnl_usd for t in trades_with_pnl if t.pnl_usd < 0]
 
-    winrate = round(len(wins) / len(trades) * 100, 1)
+    winrate = round(len(wins) / len(trades_with_pnl) * 100, 1) if trades_with_pnl else 0
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else float(gross_profit > 0)
-    total_r = round(sum(t.result_r for t in trades), 2)
+
+    trades_with_r = [t.result_r for t in trades if t.result_r is not None]
+    total_r = round(sum(trades_with_r), 2) if trades_with_r else 0
 
     streak = 0
-    if trades:
-        last_was_win = trades[-1].result_r > 0
-        for t in reversed(trades):
-            if (t.result_r > 0) == last_was_win:
+    if trades_with_pnl:
+        last_was_win = trades_with_pnl[-1].pnl_usd > 0
+        for t in reversed(trades_with_pnl):
+            if (t.pnl_usd > 0) == last_was_win:
                 streak += 1 if last_was_win else -1
             else:
                 break
 
-    equity_curve = []
-    running_total = 0
-    for t in trades:
-        running_total += t.result_r
-        equity_curve.append(round(running_total, 2))
+    pnl_total = round(sum(t.pnl_usd or 0 for t in trades), 2)
+    current_balance = round(starting_balance + pnl_total, 2)
+    pnl_pct = round((pnl_total / starting_balance) * 100, 2) if starting_balance > 0 else 0
 
-    pnl_usd_total = round(sum(t.pnl_usd or 0 for t in trades), 2)
+    # График баланса — начинается со стартового баланса, дальше шаг за шагом
+    # прибавляем pnl_usd каждой сделки по порядку
+    balance_curve = [round(starting_balance, 2)]
+    running = starting_balance
+    for t in trades:
+        running += t.pnl_usd or 0
+        balance_curve.append(round(running, 2))
 
     return {
         "total_trades": len(trades), "winrate": winrate,
         "profit_factor": profit_factor, "total_r": total_r,
-        "current_streak": streak, "equity_curve": equity_curve,
-        "pnl_usd_total": pnl_usd_total,
+        "current_streak": streak,
+        "starting_balance": round(starting_balance, 2),
+        "current_balance": current_balance,
+        "pnl_total": pnl_total, "pnl_pct": pnl_pct,
+        "balance_curve": balance_curve,
     }
 
 
@@ -160,10 +206,41 @@ def trade_to_dict(t: Trade) -> dict:
         "source": t.source,
         "note": t.note,
         "tags": t.tags or [],
+        "trade_date": t.trade_date.strftime("%d.%m.%Y %H:%M") if t.trade_date else None,
         "opened_at": t.opened_at.strftime("%d.%m.%Y %H:%M") if t.opened_at else None,
         "closed_at": t.closed_at.strftime("%d.%m.%Y %H:%M") if t.closed_at else None,
         "created_at": t.created_at.strftime("%d.%m.%Y %H:%M") if t.created_at else None,
     }
+
+
+def sort_key(t: Trade):
+    """Сортируем по дате сделки, если она указана пользователем,
+    иначе по дате создания записи — это и определяет порядок графика баланса."""
+    return t.trade_date or t.created_at or datetime.min
+
+
+# ---------- Настройки (стартовый баланс) ----------
+
+@app.get("/settings")
+def get_settings(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    settings = get_or_create_settings(user_id, db)
+    return {"starting_balance": settings.starting_balance}
+
+
+@app.post("/settings")
+def update_settings(
+    update: SettingsUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    settings = get_or_create_settings(user_id, db)
+    settings.starting_balance = update.starting_balance
+    db.commit()
+    db.refresh(settings)
+    return {"status": "ok", "starting_balance": settings.starting_balance}
 
 
 # ---------- Дашборд ----------
@@ -173,9 +250,12 @@ def get_summary(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Сводка для главного экрана: PnL, винрейт, profit factor, equity curve."""
-    trades = db.query(Trade).filter(Trade.user_id == user_id).order_by(Trade.created_at).all()
-    stats = calculate_stats(trades)
+    """Сводка для главного экрана: текущий баланс $, % прибыли, график баланса."""
+    settings = get_or_create_settings(user_id, db)
+    trades = db.query(Trade).filter(Trade.user_id == user_id).all()
+    trades = sorted(trades, key=sort_key)
+
+    stats = calculate_stats(trades, settings.starting_balance)
 
     recent = [trade_to_dict(t) for t in reversed(trades[-5:])]
 
@@ -197,21 +277,23 @@ def get_trades(
     query = db.query(Trade).filter(Trade.user_id == user_id)
 
     if result == "win":
-        query = query.filter(Trade.result_r > 0)
+        query = query.filter(Trade.pnl_usd > 0)
     elif result == "loss":
-        query = query.filter(Trade.result_r < 0)
+        query = query.filter(Trade.pnl_usd < 0)
     if source:
         query = query.filter(Trade.source == source)
     if symbol:
         query = query.filter(Trade.symbol == symbol)
 
-    trades = query.order_by(Trade.created_at).all()
+    trades = query.all()
+    trades = sorted(trades, key=sort_key)
 
     # Фильтр по тегу — отдельно, потому что tags хранится как JSON-массив
     if tag:
         trades = [t for t in trades if t.tags and tag in t.tags]
 
-    stats = calculate_stats(trades)
+    settings = get_or_create_settings(user_id, db)
+    stats = calculate_stats(trades, settings.starting_balance)
 
     return {
         "trades": [trade_to_dict(t) for t in reversed(trades)],
@@ -229,17 +311,18 @@ def add_trade(
         user_id=user_id,  # привязываем сделку именно к этому пользователю
         asset=new_trade.asset,
         direction=new_trade.direction,
-        risk_percent=new_trade.risk_percent,
         result_r=new_trade.result_r,
+        pnl_usd=new_trade.pnl_usd,
+        note=new_trade.note,
+        trade_date=new_trade.trade_date,
+        tags=new_trade.tags or [],
+        source=new_trade.source,
         symbol=new_trade.symbol or new_trade.asset,
         entry_price=new_trade.entry_price,
         exit_price=new_trade.exit_price,
         size=new_trade.size,
         leverage=new_trade.leverage,
-        pnl_usd=new_trade.pnl_usd,
-        source=new_trade.source,
-        note=new_trade.note,
-        tags=new_trade.tags or [],
+        risk_percent=new_trade.risk_percent,
         opened_at=new_trade.opened_at,
         closed_at=new_trade.closed_at,
     )
