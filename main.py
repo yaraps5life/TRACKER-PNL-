@@ -272,8 +272,12 @@ def get_trades(
     source: Optional[Literal["manual", "auto"]] = None,
     symbol: Optional[str] = None,
     tag: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,  # 1-12, имеет смысл только вместе с year
 ):
-    """Список сделок с опциональными фильтрами — под экран Журнала."""
+    """Список сделок с опциональными фильтрами — под экран Журнала
+    (вкладки: Общая / По месяцам / По годам / По винрейту / По тикерам
+    все реализованы через эти же query-параметры)."""
     query = db.query(Trade).filter(Trade.user_id == user_id)
 
     if result == "win":
@@ -292,6 +296,13 @@ def get_trades(
     if tag:
         trades = [t for t in trades if t.tags and tag in t.tags]
 
+    # Фильтр по году/месяцу — берём дату сделки (trade_date, либо created_at,
+    # та же логика, что и в sort_key, чтобы фильтр и сортировка были согласованы)
+    if year is not None:
+        trades = [t for t in trades if sort_key(t).year == year]
+    if month is not None:
+        trades = [t for t in trades if sort_key(t).month == month]
+
     settings = get_or_create_settings(user_id, db)
     stats = calculate_stats(trades, settings.starting_balance)
 
@@ -299,6 +310,28 @@ def get_trades(
         "trades": [trade_to_dict(t) for t in reversed(trades)],
         "stats": stats,
     }
+
+
+@app.get("/trades/years")
+def get_available_years(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Список лет, в которых есть хотя бы одна сделка — для вкладки 'По годам'."""
+    trades = db.query(Trade).filter(Trade.user_id == user_id).all()
+    years = sorted({sort_key(t).year for t in trades}, reverse=True)
+    return {"years": years}
+
+
+@app.get("/trades/symbols")
+def get_available_symbols(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Список уникальных тикеров, по которым есть сделки — для вкладки 'По тикерам'."""
+    trades = db.query(Trade).filter(Trade.user_id == user_id).all()
+    symbols = sorted({t.symbol or t.asset for t in trades})
+    return {"symbols": symbols}
 
 
 @app.post("/trades")
