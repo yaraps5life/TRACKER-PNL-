@@ -1,74 +1,92 @@
 """
-Проверка подлинности данных, присланных Telegram Mini App.
+Проверка подписи Telegram Mini App (initData).
 
-ЗАЧЕМ ЭТО НУЖНО:
-Фронтенд (JS в браузере) теоретически может прислать СЕРВЕРУ любые данные —
-включая "я пользователь с id=12345", даже если это неправда. Нельзя просто
-верить тому, что говорит браузер.
+Алгоритм — официальный, описанный в документации Telegram:
+https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
-Telegram решает это так: когда открывается Mini App, Telegram сам
-формирует строку с данными пользователя и ПОДПИСЫВАЕТ её, используя
-секретный токен твоего бота (который знает только Telegram и твой сервер,
-но не знает обычный пользователь и не может его подделать).
+1. Из строки initData убираем поле hash, остальные сортируем по алфавиту
+   и склеиваем в "data_check_string" вида key=value через \n.
+2. secret_key = HMAC_SHA256(bot_token, "WebAppData")
+3. Считаем HMAC_SHA256(data_check_string, secret_key) и сравниваем с hash.
+4. Если совпало — данные подписаны настоящим Telegram и им можно доверять.
 
-Алгоритм (официальная документация Telegram, core.telegram.org/bots/webapps):
-1. Взять initData, отделить параметр hash
-2. Собрать оставшиеся пары "key=value", отсортировать по алфавиту,
-   склеить через "\n"
-3. Посчитать secret_key = HMAC-SHA256(bot_token, ключ="WebAppData")
-4. Посчитать итоговый hash = HMAC-SHA256(data_check_string, ключ=secret_key)
-5. Если он совпадает с присланным hash — данные подлинные, можно доверять
+Дополнительно проверяем auth_date — если initData старше 24 часов,
+считаем её просроченной (защита от replay-атак).
 """
 
-import hmac
 import hashlib
+import hmac
 import json
+import time
 from urllib.parse import parse_qsl
+
+# Сколько секунд считаем initData валидной с момента её выдачи Telegram-ом
+MAX_AUTH_AGE_SECONDS = 24 * 60 * 60  # 24 часа
 
 
 def validate_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
     """
-    Проверяет подпись init_data. Если всё совпадает — возвращает
-    словарь с данными пользователя. Если подпись неверна — возвращает None.
+    Проверяет подпись initData. Если подпись верна и данные не просрочены —
+    возвращает словарь с данными пользователя (минимум: id).
+    Если что-то не так — возвращает None.
     """
     try:
-        # init_data приходит как строка вида "user=...&auth_date=...&hash=..."
-        parsed = dict(parse_qsl(init_data))
-        received_hash = parsed.pop("hash", None)
-        if not received_hash:
-            return None
-
-        # Шаг 2 — собираем data-check-string
-        data_check_string = "\n".join(
-            f"{key}={value}" for key, value in sorted(parsed.items())
-        )
-
-        # Шаг 3 — секретный ключ на основе токена бота
-        secret_key = hmac.new(
-            key=b"WebAppData",
-            msg=bot_token.encode(),
-            digestmod=hashlib.sha256
-        ).digest()
-
-        # Шаг 4 — итоговый хеш
-        calculated_hash = hmac.new(
-            key=secret_key,
-            msg=data_check_string.encode(),
-            digestmod=hashlib.sha256
-        ).hexdigest()
-
-        # Шаг 5 — сравнение
-        if calculated_hash != received_hash:
-            return None
-
-        # Если подпись верна — достаём и возвращаем данные о пользователе
-        user_json = parsed.get("user")
-        if not user_json:
-            return None
-
-        return json.loads(user_json)
-
+        # parse_qsl сохраняет порядок и не схлопывает повторяющиеся ключи —
+        # для initData это безопаснее, чем parse_qs
+        pairs = parse_qsl(init_data, keep_blank_values=True)
     except Exception:
-        # Любая ошибка разбора (повреждённые данные, неверный формат) —
-        # считаем данные недействительными, а не бросаем сервер в ошибку 500
         return None
+
+    data = dict(pairs)
+    received_hash = data.pop("hash", None)
+    if not received_hash:
+        return None
+
+    # Шаг 1 — собираем data_check_string из всех полей кроме hash,
+    # отсортированных по алфавиту
+    data_check_string = "\n".join(
+        f"{key}={value}" for key, value in sorted(data.items())
+    )
+
+    # Шаг 2 — secret_key = HMAC_SHA256(bot_token, "WebAppData")
+    secret_key = hmac.new(
+        key=b"WebAppData",
+        msg=bot_token.encode(),
+        digestmod=hashlib.sha256,
+    ).digest()
+
+    # Шаг 3 — считаем итоговый хэш и сравниваем
+    calculated_hash = hmac.new(
+        key=secret_key,
+        msg=data_check_string.encode(),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    # compare_digest вместо "==" — защита от timing-атак при сравнении строк
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        return None
+
+    # Шаг 4 — проверяем, что данные не протухли
+    auth_date = data.get("auth_date")
+    if auth_date is not None:
+        try:
+            age = time.time() - int(auth_date)
+        except ValueError:
+            return None
+        if age > MAX_AUTH_AGE_SECONDS or age < 0:
+            return None
+
+    # user приходит как JSON-строка вида {"id":123,"first_name":"..."}
+    user_raw = data.get("user")
+    if not user_raw:
+        return None
+
+    try:
+        user = json.loads(user_raw)
+    except json.JSONDecodeError:
+        return None
+
+    if "id" not in user:
+        return None
+
+    return user
