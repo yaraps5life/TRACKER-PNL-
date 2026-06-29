@@ -425,7 +425,7 @@ def stats_by_tag(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """PnL по тегам/сетапам — под экран Аналитики.
+    """Суммарный R по тегам (сетап/сессия) — под экран Аналитики.
     Считаем в Python, а не в SQL, потому что tags — JSON-массив
     и одна сделка может относиться к нескольким тегам сразу."""
     trades = db.query(Trade).filter(Trade.user_id == user_id).all()
@@ -434,14 +434,12 @@ def stats_by_tag(
     for t in trades:
         for tag in (t.tags or []):
             if tag not in by_tag:
-                by_tag[tag] = {"tag": tag, "pnl_usd": 0, "total_r": 0, "count": 0}
-            by_tag[tag]["pnl_usd"] += t.pnl_usd or 0
-            by_tag[tag]["total_r"] += t.result_r
+                by_tag[tag] = {"tag": tag, "total_r": 0, "count": 0}
+            by_tag[tag]["total_r"] += t.result_r or 0
             by_tag[tag]["count"] += 1
 
-    result = sorted(by_tag.values(), key=lambda x: x["pnl_usd"], reverse=True)
+    result = sorted(by_tag.values(), key=lambda x: x["total_r"], reverse=True)
     for r in result:
-        r["pnl_usd"] = round(r["pnl_usd"], 2)
         r["total_r"] = round(r["total_r"], 2)
 
     return {"by_tag": result}
@@ -484,3 +482,4 @@ def delete_all_data(
 
     db.commit()
     return {"status": "ok", "deleted_trades": deleted_trades}
+
