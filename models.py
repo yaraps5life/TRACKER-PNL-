@@ -65,3 +65,14 @@ class UserSettings(Base):
     user_id = Column(BigInteger, primary_key=True, index=True)
     starting_balance = Column(Float, default=0.0)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FavoriteSymbol(Base):
+    """Избранные тикеры пользователя — показываются в выпадающем списке
+    "Актив" в форме добавления сделки, чтобы не вводить тикер каждый раз руками."""
+    __tablename__ = "favorite_symbols"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(BigInteger, index=True, nullable=False)
+    symbol = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
