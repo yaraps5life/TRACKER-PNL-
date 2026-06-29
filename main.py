@@ -1,26 +1,28 @@
 """
-Бэкенд журнала сделок v4 — с авторизацией через Telegram и PostgreSQL.
+Бэкенд журнала сделок v5 — с авторизацией через Telegram и PostgreSQL.
 
 Каждый запрос должен содержать заголовок
 "Authorization: tma <init_data>" — это подпись Telegram,
 из которой сервер достаёт user_id и работает ТОЛЬКО с данными этого юзера.
 
-Логика баланса: пользователь один раз задаёт стартовый баланс счёта
-(GET/POST /settings), а текущий баланс на дашборде считается как
-starting_balance + сумма pnl_usd всех сделок. % прибыли считается
-от стартового баланса.
+Логика баланса на дашборде: сумма result_r (Risk Reward) по всем сделкам —
+без долларов и без стартового депозита. /settings оставлен для совместимости,
+но в расчётах дашборда больше не участвует.
 
 Эндпоинты:
-  GET  /settings             — получить стартовый баланс
-  POST /settings             — задать/изменить стартовый баланс
-  GET  /stats/summary        — сводка для дашборда (баланс $, % прибыли, график баланса)
+  GET  /settings             — устаревший эндпоинт (оставлен для совместимости)
+  POST /settings             — устаревший эндпоинт (оставлен для совместимости)
+  GET  /stats/summary        — сводка для дашборда (суммарный R, график R)
   GET  /trades               — список сделок с фильтрами (журнал)
+  GET  /trades/years         — список лет, в которых есть сделки
+  GET  /trades/symbols       — список уникальных тикеров
   GET  /trades/{trade_id}    — одна сделка (деталь)
   PATCH /trades/{trade_id}   — обновить заметку/теги
   DELETE /trades/{trade_id}  — удалить сделку
   POST /trades               — добавить сделку вручную
   GET  /stats/by-tag         — PnL по тегам/сетапам (аналитика)
   GET  /tags                 — список всех тегов пользователя
+  DELETE /account/data       — удалить все сделки пользователя
 
 Как запустить локально:
    pip install fastapi uvicorn sqlalchemy psycopg2-binary --break-system-packages
@@ -64,14 +66,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_СВО
 class NewTrade(BaseModel):
     asset: str
     direction: Literal["long", "short"]
-    result_r: Optional[float] = None       # Risk Reward — только для статистики
-    pnl_usd: Optional[float] = None        # двигает баланс счёта
+    trade_date: Optional[datetime] = None  # если не передано — ставим "сегодня" на сервере
+    result_r: Optional[float] = None       # Risk Reward — двигает суммарный R на дашборде
+    outcome: Optional[Literal["win", "loss", "breakeven"]] = None  # статус без суммы $
     note: Optional[str] = None
-    trade_date: Optional[datetime] = None  # дата сделки, не обязательна
     tags: Optional[list[str]] = None
     source: Literal["manual", "auto"] = "manual"
 
     # поля под будущую авто-синхронизацию — не из формы, но поддерживаются API
+    pnl_usd: Optional[float] = None
     symbol: Optional[str] = None
     entry_price: Optional[float] = None
     exit_price: Optional[float] = None
@@ -126,67 +129,57 @@ def get_or_create_settings(user_id: int, db: Session) -> UserSettings:
 
 # ---------- Расчёт статистики (баланс счёта в $, % прибыли) ----------
 
-def calculate_stats(trades: list[Trade], starting_balance: float) -> dict:
+def calculate_stats(trades: list[Trade]) -> dict:
     """
-    Главная логика дашборда:
-    - current_balance = starting_balance + сумма pnl_usd всех сделок
-    - pnl_pct = процент прибыли от starting_balance
-    - balance_curve = история баланса по каждой сделке (для графика) —
-      считается в хронологическом порядке (trades должны быть отсортированы по дате)
-    Winrate/profit factor считаются по pnl_usd, где он указан; если pnl_usd
-    не указан у сделки — она не участвует в этих метриках (но участвует в R-статистике).
+    Главная логика дашборда (без долларов и без стартового баланса):
+    - total_r_balance = сумма result_r всех сделок — это и есть "баланс" на дашборде
+    - r_curve = накопительная сумма R по сделкам в хронологическом порядке (для графика)
+    - winrate считается по полю outcome (win/loss/breakeven), а не по сумме $;
+      сделки без outcome не участвуют в винрейте, но участвуют в сумме R, если у них есть result_r.
     """
     if not trades:
         return {
             "total_trades": 0, "winrate": 0, "profit_factor": 0,
             "total_r": 0, "current_streak": 0,
-            "starting_balance": round(starting_balance, 2),
-            "current_balance": round(starting_balance, 2),
-            "pnl_total": 0, "pnl_pct": 0,
-            "balance_curve": [round(starting_balance, 2)],
+            "r_curve": [0],
         }
 
-    trades_with_pnl = [t for t in trades if t.pnl_usd is not None]
-    wins = [t.pnl_usd for t in trades_with_pnl if t.pnl_usd > 0]
-    losses = [t.pnl_usd for t in trades_with_pnl if t.pnl_usd < 0]
+    trades_with_outcome = [t for t in trades if t.outcome is not None]
+    wins = [t for t in trades_with_outcome if t.outcome == "win"]
+    losses = [t for t in trades_with_outcome if t.outcome == "loss"]
 
-    winrate = round(len(wins) / len(trades_with_pnl) * 100, 1) if trades_with_pnl else 0
-    gross_profit = sum(wins)
-    gross_loss = abs(sum(losses))
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else float(gross_profit > 0)
+    winrate = round(len(wins) / len(trades_with_outcome) * 100, 1) if trades_with_outcome else 0
 
-    trades_with_r = [t.result_r for t in trades if t.result_r is not None]
-    total_r = round(sum(trades_with_r), 2) if trades_with_r else 0
+    # Profit factor через R: сумма положительных R / |сумма отрицательных R|
+    positive_r = sum(t.result_r for t in trades if t.result_r is not None and t.result_r > 0)
+    negative_r = abs(sum(t.result_r for t in trades if t.result_r is not None and t.result_r < 0))
+    profit_factor = round(positive_r / negative_r, 2) if negative_r > 0 else float(positive_r > 0)
+
+    total_r = round(sum(t.result_r or 0 for t in trades), 2)
 
     streak = 0
-    if trades_with_pnl:
-        last_was_win = trades_with_pnl[-1].pnl_usd > 0
-        for t in reversed(trades_with_pnl):
-            if (t.pnl_usd > 0) == last_was_win:
+    if trades_with_outcome:
+        last_was_win = trades_with_outcome[-1].outcome == "win"
+        for t in reversed(trades_with_outcome):
+            if t.outcome == "breakeven":
+                break
+            if (t.outcome == "win") == last_was_win:
                 streak += 1 if last_was_win else -1
             else:
                 break
 
-    pnl_total = round(sum(t.pnl_usd or 0 for t in trades), 2)
-    current_balance = round(starting_balance + pnl_total, 2)
-    pnl_pct = round((pnl_total / starting_balance) * 100, 2) if starting_balance > 0 else 0
-
-    # График баланса — начинается со стартового баланса, дальше шаг за шагом
-    # прибавляем pnl_usd каждой сделки по порядку
-    balance_curve = [round(starting_balance, 2)]
-    running = starting_balance
+    # График R — накопительная сумма по сделкам в хронологическом порядке
+    r_curve = [0]
+    running = 0
     for t in trades:
-        running += t.pnl_usd or 0
-        balance_curve.append(round(running, 2))
+        running += t.result_r or 0
+        r_curve.append(round(running, 2))
 
     return {
         "total_trades": len(trades), "winrate": winrate,
         "profit_factor": profit_factor, "total_r": total_r,
         "current_streak": streak,
-        "starting_balance": round(starting_balance, 2),
-        "current_balance": current_balance,
-        "pnl_total": pnl_total, "pnl_pct": pnl_pct,
-        "balance_curve": balance_curve,
+        "r_curve": r_curve,
     }
 
 
@@ -198,6 +191,7 @@ def trade_to_dict(t: Trade) -> dict:
         "direction": t.direction,
         "risk_percent": t.risk_percent,
         "result_r": t.result_r,
+        "outcome": t.outcome,
         "entry_price": t.entry_price,
         "exit_price": t.exit_price,
         "size": t.size,
@@ -250,12 +244,11 @@ def get_summary(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Сводка для главного экрана: текущий баланс $, % прибыли, график баланса."""
-    settings = get_or_create_settings(user_id, db)
+    """Сводка для главного экрана: суммарный R (баланс в R), график R по сделкам."""
     trades = db.query(Trade).filter(Trade.user_id == user_id).all()
     trades = sorted(trades, key=sort_key)
 
-    stats = calculate_stats(trades, settings.starting_balance)
+    stats = calculate_stats(trades)
 
     recent = [trade_to_dict(t) for t in reversed(trades[-5:])]
 
@@ -268,7 +261,7 @@ def get_summary(
 def get_trades(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
-    result: Optional[Literal["win", "loss"]] = None,
+    result: Optional[Literal["win", "loss", "breakeven"]] = None,
     source: Optional[Literal["manual", "auto"]] = None,
     symbol: Optional[str] = None,
     tag: Optional[str] = None,
@@ -280,10 +273,8 @@ def get_trades(
     все реализованы через эти же query-параметры)."""
     query = db.query(Trade).filter(Trade.user_id == user_id)
 
-    if result == "win":
-        query = query.filter(Trade.pnl_usd > 0)
-    elif result == "loss":
-        query = query.filter(Trade.pnl_usd < 0)
+    if result:
+        query = query.filter(Trade.outcome == result)
     if source:
         query = query.filter(Trade.source == source)
     if symbol:
@@ -303,8 +294,7 @@ def get_trades(
     if month is not None:
         trades = [t for t in trades if sort_key(t).month == month]
 
-    settings = get_or_create_settings(user_id, db)
-    stats = calculate_stats(trades, settings.starting_balance)
+    stats = calculate_stats(trades)
 
     return {
         "trades": [trade_to_dict(t) for t in reversed(trades)],
@@ -345,9 +335,10 @@ def add_trade(
         asset=new_trade.asset,
         direction=new_trade.direction,
         result_r=new_trade.result_r,
+        outcome=new_trade.outcome,
         pnl_usd=new_trade.pnl_usd,
         note=new_trade.note,
-        trade_date=new_trade.trade_date,
+        trade_date=new_trade.trade_date or datetime.utcnow(),  # дата обязательна — если не передана, берём "сегодня"
         tags=new_trade.tags or [],
         source=new_trade.source,
         symbol=new_trade.symbol or new_trade.asset,
@@ -473,3 +464,23 @@ def get_tags(
             unique_tags.add(tag)
 
     return {"tags": sorted(unique_tags)}
+
+
+# ---------- Удаление всех данных ----------
+
+@app.delete("/account/data")
+def delete_all_data(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Полный сброс: удаляет ВСЕ сделки пользователя и сбрасывает
+    стартовый баланс обратно в 0. Безвозвратно — подтверждение должно
+    быть запрошено на фронтенде ДО вызова этого эндпоинта."""
+    deleted_trades = db.query(Trade).filter(Trade.user_id == user_id).delete()
+
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+    if settings:
+        settings.starting_balance = 0.0
+
+    db.commit()
+    return {"status": "ok", "deleted_trades": deleted_trades}
