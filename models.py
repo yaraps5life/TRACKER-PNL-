@@ -3,10 +3,13 @@
 описывать таблицы как обычные Python-классы, а не писать SQL руками.
 Каждый класс ниже = одна таблица в PostgreSQL.
 
-v4 — упрощённая модель ввода сделки (дата/актив/направление/R/PnL$/заметка —
-всё кроме актива и направления необязательно) + баланс счёта:
-у каждого юзера есть стартовый баланс (UserSettings), а текущий баланс
-считается как starting_balance + сумма всех pnl_usd по сделкам.
+v5 — форма ввода сделки: дата (обязательна, по умолчанию сегодня),
+актив, направление (long/short), Risk Reward (R), результат как статус
+(win/loss/breakeven через поле outcome — без суммы в $), заметка.
+Баланс на дашборде теперь = сумма result_r по всем сделкам (без долларов
+и без стартового депозита). pnl_usd оставлен в таблице для совместимости
+со старыми записями и под будущую авто-синхронизацию, но форма ввода
+его больше не использует.
 """
 
 from sqlalchemy import Column, Integer, String, Float, DateTime, BigInteger, JSON
@@ -28,15 +31,16 @@ class Trade(Base):
     # --- обязательные поля формы ввода ---
     asset = Column(String, nullable=False)             # название актива, напр. "BTCUSDT"
     direction = Column(String, nullable=False)          # "long" или "short"
+    trade_date = Column(DateTime, nullable=False, default=datetime.utcnow)  # дата сделки, по умолчанию сегодня
 
     # --- необязательные поля формы ввода ---
-    result_r = Column(Float, nullable=True)             # Risk Reward — только для статистики, не влияет на баланс
-    pnl_usd = Column(Float, nullable=True)              # PnL в долларах — то, что двигает баланс счёта
+    result_r = Column(Float, nullable=True)             # Risk Reward — двигает суммарный R на дашборде
+    outcome = Column(String, nullable=True)             # "win" | "loss" | "breakeven" — статус без суммы $
     note = Column(String, nullable=True)                # свободная заметка по сделке
-    trade_date = Column(DateTime, nullable=True)         # дата сделки, указанная пользователем (не обязательна)
 
-    # --- старое поле, оставлено для совместимости со старыми записями ---
+    # --- старые поля, оставлены для совместимости со старыми записями ---
     risk_percent = Column(Float, nullable=True)
+    pnl_usd = Column(Float, nullable=True)
 
     # --- поля под будущую авто-синхронизацию с Binance ---
     symbol = Column(String, nullable=True)
@@ -53,8 +57,9 @@ class Trade(Base):
 
 
 class UserSettings(Base):
-    """Настройки конкретного юзера — пока только стартовый баланс счёта,
-    от которого считается текущий баланс и % прибыли на дашборде."""
+    """Настройки пользователя. starting_balance оставлено для совместимости
+    (раньше использовалось для баланса в $), но больше не участвует
+    в расчётах на дашборде — там теперь сумма R."""
     __tablename__ = "user_settings"
 
     user_id = Column(BigInteger, primary_key=True, index=True)
