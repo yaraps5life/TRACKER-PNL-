@@ -68,14 +68,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_СВО
 class NewTrade(BaseModel):
     asset: str
     direction: Literal["long", "short"]
-    trade_date: Optional[datetime] = None  # если не передано — ставим "сегодня" на сервере
-    result_r: Optional[float] = None       # Risk Reward — двигает суммарный R на дашборде
-    outcome: Optional[Literal["win", "loss", "breakeven"]] = None  # статус без суммы $
+    trade_date: Optional[datetime] = None
+    result_r: Optional[float] = None
+    outcome: Optional[Literal["win", "loss", "breakeven"]] = None
     note: Optional[str] = None
     tags: Optional[list[str]] = None
     source: Literal["manual", "auto"] = "manual"
 
-    # поля под будущую авто-синхронизацию — не из формы, но поддерживаются API
     pnl_usd: Optional[float] = None
     symbol: Optional[str] = None
     entry_price: Optional[float] = None
@@ -83,6 +82,8 @@ class NewTrade(BaseModel):
     size: Optional[float] = None
     leverage: Optional[float] = None
     risk_percent: Optional[float] = None
+    risk_amount: Optional[float] = None
+    risk_type: Optional[str] = None
     opened_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
 
@@ -100,6 +101,8 @@ class UpdateTrade(BaseModel):
     exit_price: Optional[float] = None
     size: Optional[float] = None
     leverage: Optional[float] = None
+    risk_amount: Optional[float] = None
+    risk_type: Optional[str] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -201,6 +204,8 @@ def trade_to_dict(t: Trade) -> dict:
         "symbol": t.symbol or t.asset,
         "direction": t.direction,
         "risk_percent": t.risk_percent,
+        "risk_amount": t.risk_amount,
+        "risk_type": t.risk_type,
         "result_r": t.result_r,
         "outcome": t.outcome,
         "entry_price": t.entry_price,
@@ -372,6 +377,8 @@ def add_trade(
         exit_price=new_trade.exit_price,
         size=new_trade.size,
         leverage=new_trade.leverage,
+        risk_amount=new_trade.risk_amount,
+        risk_type=new_trade.risk_type,
         risk_percent=new_trade.risk_percent,
         opened_at=new_trade.opened_at,
         closed_at=new_trade.closed_at,
@@ -438,6 +445,10 @@ def update_trade(
         trade.size = update.size
     if update.leverage is not None:
         trade.leverage = update.leverage
+    if update.risk_amount is not None:
+        trade.risk_amount = update.risk_amount
+    if update.risk_type is not None:
+        trade.risk_type = update.risk_type
 
     db.commit()
     db.refresh(trade)
