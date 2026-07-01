@@ -42,6 +42,10 @@ class Trade(Base):
     risk_percent = Column(Float, nullable=True)
     pnl_usd = Column(Float, nullable=True)
 
+    # --- риск на сделку (переопределяет глобальный из настроек) ---
+    risk_amount = Column(Float, nullable=True)   # числовое значение риска
+    risk_type = Column(String, nullable=True)    # 'r' | 'usd' | 'pct'
+
     # --- поля под будущую авто-синхронизацию с Binance ---
     symbol = Column(String, nullable=True)
     entry_price = Column(Float, nullable=True)
