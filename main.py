@@ -254,14 +254,29 @@ def update_settings(
 def get_summary(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    result: Optional[Literal["win", "loss", "breakeven"]] = None,
 ):
-    """Сводка для главного экрана: суммарный R (баланс в R), график R по сделкам."""
-    trades = db.query(Trade).filter(Trade.user_id == user_id).all()
-    trades = sorted(trades, key=sort_key)
+    """Сводка для главного экрана: суммарный R, график R.
+    Поддерживает фильтры year, month, result для фильтрованного дашборда."""
+    query = db.query(Trade).filter(Trade.user_id == user_id)
 
+    if year:
+        query = query.filter(func.extract('year', Trade.trade_date) == year)
+    if month and year:
+        query = query.filter(func.extract('month', Trade.trade_date) == month)
+    if result:
+        query = query.filter(Trade.outcome == result)
+
+    trades = sorted(query.all(), key=sort_key)
     stats = calculate_stats(trades)
 
-    recent = [trade_to_dict(t) for t in reversed(trades[-5:])]
+    # recent_trades только для общего вида (без фильтров)
+    if not year and not month and not result:
+        recent = [trade_to_dict(t) for t in reversed(trades[-5:])]
+    else:
+        recent = []
 
     return {"stats": stats, "recent_trades": recent}
 
