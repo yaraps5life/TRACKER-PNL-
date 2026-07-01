@@ -86,9 +86,18 @@ class NewTrade(BaseModel):
 
 
 class UpdateTrade(BaseModel):
-    """Для PATCH — обычно меняют только заметку и теги уже импортированной сделки."""
+    """Для PATCH — все поля опциональны, обновляются только те что переданы."""
     note: Optional[str] = None
     tags: Optional[list[str]] = None
+    symbol: Optional[str] = None
+    direction: Optional[str] = None
+    outcome: Optional[str] = None
+    result_r: Optional[float] = None
+    trade_date: Optional[str] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    size: Optional[float] = None
+    leverage: Optional[float] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -394,6 +403,24 @@ def update_trade(
         trade.note = update.note
     if update.tags is not None:
         trade.tags = update.tags
+    if update.symbol is not None:
+        trade.symbol = update.symbol
+    if update.direction is not None:
+        trade.direction = update.direction
+    if update.outcome is not None:
+        trade.outcome = update.outcome
+    if update.result_r is not None:
+        trade.result_r = update.result_r
+    if update.trade_date is not None:
+        trade.trade_date = update.trade_date
+    if update.entry_price is not None:
+        trade.entry_price = update.entry_price
+    if update.exit_price is not None:
+        trade.exit_price = update.exit_price
+    if update.size is not None:
+        trade.size = update.size
+    if update.leverage is not None:
+        trade.leverage = update.leverage
 
     db.commit()
     db.refresh(trade)
