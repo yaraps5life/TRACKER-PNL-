@@ -668,3 +668,420 @@ def public_trades(token: str, db: Session = Depends(get_db)):
     trades = db.query(Trade).filter(Trade.user_id == link.user_id)\
         .order_by(Trade.trade_date.desc()).all()
     return {"trades": [trade_to_dict(t) for t in trades]}
+
+
+@app.get("/s/{token}", response_class=None)
+def share_page(token: str, db: Session = Depends(get_db)):
+    """Публичная HTML-страница журнала — отдаётся напрямую браузеру."""
+    from fastapi.responses import HTMLResponse
+
+    link = db.query(ShareLink).filter(
+        ShareLink.token == token, ShareLink.is_active == True
+    ).first()
+
+    if not link:
+        html = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Журнал не найден</title>
+<style>body{background:#0D1117;color:#8B949E;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center}h1{color:#E6EDF3;font-size:24px;margin-bottom:8px}p{font-size:14px}</style>
+</head><body><div><h1>🔗 Ссылка не найдена</h1><p>Возможно, владелец отозвал доступ к журналу.</p></div></body></html>"""
+        return HTMLResponse(content=html, status_code=404)
+
+    trades_raw = db.query(Trade).filter(Trade.user_id == link.user_id)\
+        .order_by(Trade.trade_date.asc()).all()
+    all_trades = [trade_to_dict(t) for t in trades_raw]
+    stats = calculate_stats(trades_raw)
+
+    import json
+    trades_json = json.dumps(all_trades, ensure_ascii=False)
+    stats_json  = json.dumps(stats,       ensure_ascii=False)
+
+    html = f"""<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Журнал трейдера</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{{
+  --bg:#0D1117;--surface:#161B22;--surface-2:#1C2128;
+  --border:rgba(255,255,255,0.08);--border-soft:rgba(255,255,255,0.04);
+  --text:#E6EDF3;--text-secondary:#8B949E;--text-muted:#6E7681;--text-faint:#484F58;
+  --success:#3DDC97;--success-bg:rgba(61,220,151,0.12);
+  --danger:#E5534B;--danger-bg:rgba(229,83,75,0.12);
+  --accent:#58A6FF;--accent-bg:rgba(88,166,255,0.12);
+  --warning:#D29922;--warning-bg:rgba(210,153,34,0.12);
+  --font:'Inter',-apple-system,sans-serif;
+  --mono:'JetBrains Mono',monospace;
+  --radius:12px;--radius-sm:8px;
+}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;min-height:100vh}}
+/* Layout */
+.wrap{{max-width:640px;margin:0 auto;padding:0 16px}}
+/* Header */
+.hdr{{padding:28px 0 20px}}
+.hdr-badge{{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:12px}}
+.hdr-badge::before{{content:'';width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success);flex-shrink:0}}
+.hdr h1{{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-bottom:3px}}
+.hdr-sub{{font-size:13px;color:var(--text-muted)}}
+/* Stats card */
+.stats-card{{background:linear-gradient(135deg,#141920 0%,#0f1419 100%);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:14px}}
+.stats-top{{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px}}
+.stats-card-label{{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:rgba(255,255,255,.4)}}
+.stats-pnl{{font-family:var(--mono);font-size:38px;font-weight:600;letter-spacing:-.02em;line-height:1;margin-bottom:16px}}
+.stats-pnl.positive{{color:var(--success)}}.stats-pnl.negative{{color:var(--danger)}}.stats-pnl.neutral{{color:var(--text-muted)}}
+canvas#chart{{width:100%;height:60px;display:block;margin-bottom:16px}}
+.metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;border-top:1px solid var(--border);padding-top:14px}}
+.metric-label{{font-size:11px;color:rgba(255,255,255,.4);margin-bottom:3px}}
+.metric-value{{font-family:var(--mono);font-size:17px;font-weight:600;color:rgba(255,255,255,.9)}}
+/* Mode switch */
+.mode-switch{{display:flex;background:rgba(255,255,255,.07);border-radius:6px;padding:2px;gap:2px;flex-shrink:0}}
+.mode-btn{{font-size:11px;font-weight:600;padding:3px 9px;border:none;background:none;color:rgba(255,255,255,.35);border-radius:4px;cursor:pointer;font-family:var(--font)}}
+.mode-btn.active{{background:rgba(255,255,255,.13);color:rgba(255,255,255,.9)}}
+/* Risk row */
+.risk-row{{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:14px}}
+.risk-row span{{font-size:12px;color:var(--text-secondary);flex:1}}
+.risk-field{{display:flex;align-items:center;gap:4px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:5px 8px}}
+.risk-cur{{font-size:12px;color:var(--text-muted);font-family:var(--mono)}}
+.risk-field input{{width:60px;border:none;background:none;font-family:var(--mono);font-size:13px;color:var(--text);outline:none;text-align:right}}
+.risk-row-hidden{{display:none}}
+/* Tabs */
+.tabs{{display:flex;gap:0;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--border);margin-bottom:10px}}
+.tabs::-webkit-scrollbar{{display:none}}
+.tab{{font-size:13px;font-weight:500;padding:8px 4px;margin-right:16px;border:none;background:none;color:var(--text-muted);white-space:nowrap;cursor:pointer;font-family:var(--font);border-bottom:2px solid transparent;position:relative;top:1px;flex-shrink:0}}
+.tab.active{{color:var(--text);border-bottom-color:var(--accent);font-weight:600}}
+/* Subfilter */
+.subfilter{{margin-bottom:10px;display:none}}
+.subfilter.visible{{display:block}}
+.subfilter select{{width:100%;padding:9px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;font-family:var(--font);outline:none}}
+/* Summary row */
+.summary-row{{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);margin-bottom:8px;flex-wrap:wrap}}
+.summary-dot{{color:var(--text-faint)}}
+.summary-rr{{font-weight:600;font-family:var(--mono)}}
+.summary-rr.positive{{color:var(--success)}}.summary-rr.negative{{color:var(--danger)}}
+/* Table */
+.trades-table{{width:100%;border-collapse:collapse;font-size:13px}}
+.trades-table th{{text-align:left;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;padding:0 0 9px;border-bottom:1px solid var(--border);white-space:nowrap}}
+.trades-table th+th{{padding-left:10px}}
+.trades-table td{{padding:10px 0;border-bottom:1px solid var(--border-soft);vertical-align:top}}
+.trades-table td+td{{padding-left:10px}}
+.trades-table tbody tr{{cursor:pointer;transition:background .1s}}
+.trades-table tbody tr:hover td{{background:rgba(255,255,255,.025)}}
+.trades-table tbody tr:last-child td{{border-bottom:none}}
+.cell-date{{font-family:var(--mono);font-size:11px;color:var(--text-secondary);white-space:nowrap}}
+.cell-symbol{{font-weight:600;white-space:nowrap}}
+.dir-badge{{font-size:11px;font-weight:600;padding:2px 7px;border-radius:999px;display:inline-block;white-space:nowrap}}
+.dir-badge.long{{background:var(--success-bg);color:var(--success)}}.dir-badge.short{{background:var(--danger-bg);color:var(--danger)}}
+.cell-r{{font-family:var(--mono);font-weight:600;white-space:nowrap}}
+.cell-r.positive{{color:var(--success)}}.cell-r.negative{{color:var(--danger)}}
+.out-badge{{font-size:11px;font-weight:600;padding:2px 7px;border-radius:999px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}}
+.out-badge::before{{content:'●';font-size:7px}}
+.out-badge.win{{background:var(--success-bg);color:var(--success)}}.out-badge.loss{{background:var(--danger-bg);color:var(--danger)}}.out-badge.breakeven{{background:rgba(255,255,255,.06);color:var(--text-muted)}}
+/* Detail expand */
+.detail-inner{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:11px 13px;margin:2px 0 4px;display:grid;grid-template-columns:1fr 1fr;gap:8px 16px}}
+.di-label{{font-size:10px;color:var(--text-muted);margin-bottom:2px;text-transform:uppercase;letter-spacing:.04em}}
+.di-value{{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text)}}
+.trade-note{{font-size:12px;color:var(--text-secondary);background:var(--surface-2);border-left:2px solid var(--border);padding:8px 12px;border-radius:0 var(--radius-sm) var(--radius-sm) 0;margin-top:6px;line-height:1.5;white-space:pre-wrap}}
+/* Empty */
+.empty{{text-align:center;padding:48px 0;color:var(--text-muted)}}
+.empty-icon{{font-size:32px;margin-bottom:10px}}
+.empty-title{{font-size:15px;font-weight:600;color:var(--text-secondary);margin-bottom:4px}}
+/* Footer */
+.footer{{text-align:center;padding:24px 0 36px;font-size:12px;color:var(--text-muted)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="hdr-badge">Публичный журнал</div>
+    <h1>Журнал трейдера</h1>
+    <div class="hdr-sub" id="hdr-sub">—</div>
+  </div>
+
+  <div class="stats-card">
+    <div class="stats-top">
+      <div>
+        <div class="stats-card-label" id="pnl-label">Суммарный R</div>
+        <div class="stats-pnl neutral" id="stat-pnl">—</div>
+      </div>
+      <div class="mode-switch">
+        <button class="mode-btn active" data-mode="r">R</button>
+        <button class="mode-btn" data-mode="usd">$</button>
+        <button class="mode-btn" data-mode="pct">%</button>
+      </div>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="metrics">
+      <div><div class="metric-label">Винрейт</div><div class="metric-value" id="stat-wr">—</div></div>
+      <div><div class="metric-label">Profit factor</div><div class="metric-value" id="stat-pf">—</div></div>
+      <div><div class="metric-label">Сделок</div><div class="metric-value" id="stat-cnt">—</div></div>
+    </div>
+  </div>
+
+  <div class="risk-row" id="risk-row">
+    <span>Риск на сделку (для расчёта $ и %)</span>
+    <div class="risk-field">
+      <span class="risk-cur">$</span>
+      <input type="number" id="risk-usd" placeholder="50" step="1" min="1">
+    </div>
+    <div class="risk-field">
+      <span class="risk-cur">%</span>
+      <input type="number" id="risk-pct" placeholder="0.25" step="0.01" min="0.01">
+    </div>
+  </div>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-view="all">Общая</button>
+    <button class="tab" data-view="month">По месяцам</button>
+    <button class="tab" data-view="year">По годам</button>
+    <button class="tab" data-view="winrate">По итогу</button>
+  </div>
+
+  <div class="subfilter" id="subfilter">
+    <select id="subfilter-select"></select>
+  </div>
+
+  <div class="summary-row">
+    <span id="sum-count">0 сделок</span>
+    <span class="summary-dot">·</span>
+    <span id="sum-wr">винрейт —</span>
+    <span class="summary-dot">·</span>
+    <span class="summary-rr" id="sum-rr">R —</span>
+  </div>
+
+  <div id="trades-wrap">
+    <div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">Загрузка...</div></div>
+  </div>
+</div>
+
+<div class="footer">Журнал трейдера · PnL Tracker</div>
+
+<script>
+const ALL_TRADES = {trades_json};
+const INIT_STATS = {stats_json};
+
+let pnlMode = 'r';
+let view = 'all';
+let subfilter = '';
+let riskUsd = 0, riskPct = 0;
+
+/* ── Утилиты ── */
+function fmtR(v){{
+  if(v===null||v===undefined)return'—';
+  return(v>0?'+':'')+v.toFixed(1)+'R';
+}}
+function fmtPnl(v){{
+  if(v===null||v===undefined)return'—';
+  if(pnlMode==='usd'){{
+    if(!riskUsd)return fmtR(v);
+    const u=v*riskUsd; return(u>0?'+':'')+u.toFixed(0)+'$';
+  }}
+  if(pnlMode==='pct'){{
+    if(!riskPct)return fmtR(v);
+    const p=v*riskPct; return(p>0?'+':'')+p.toFixed(2)+'%';
+  }}
+  return fmtR(v);
+}}
+function pnlClass(v){{return v>0?'positive':v<0?'negative':'neutral'}}
+function outcomeLabel(o){{return o==='win'?'прибыль':o==='loss'?'убыток':o==='breakeven'?'безубыток':'—'}}
+function tradesWord(n){{
+  const m10=n%10,m100=n%100;
+  if(m10===1&&m100!==11)return'сделка';
+  if([2,3,4].includes(m10)&&![12,13,14].includes(m100))return'сделки';
+  return'сделок';
+}}
+
+/* ── Фильтрация ── */
+function getMonthKey(t){{
+  const d=t.trade_date||t.created_at||'';
+  const m=d.match(/([0-9]{{4}})[.]?([0-9]{{2}})/);
+  return m?m[1]+'-'+m[2]:null;
+}}
+function getYearKey(t){{
+  const d=t.trade_date||t.created_at||'';
+  const m=d.match(/([0-9]{{4}})/);
+  return m?m[1]:null;
+}}
+function filterTrades(){{
+  let rows=[...ALL_TRADES].reverse(); // desc order
+  if(view==='month'&&subfilter) rows=rows.filter(t=>getMonthKey(t)===subfilter);
+  if(view==='year'&&subfilter)  rows=rows.filter(t=>getYearKey(t)===subfilter);
+  if(view==='winrate'&&subfilter) rows=rows.filter(t=>t.outcome===subfilter);
+  return rows;
+}}
+
+/* ── Статистика по набору строк ── */
+function calcStats(rows){{
+  const total=rows.length;
+  const decided=rows.filter(t=>t.outcome==='win'||t.outcome==='loss');
+  const wins=decided.filter(t=>t.outcome==='win').length;
+  const wr=decided.length?Math.round(wins/decided.length*100):null;
+  const totalR=rows.reduce((s,t)=>s+(t.result_r||0),0);
+  return{{total,wr,totalR}};
+}}
+
+/* ── График ── */
+function drawChart(values){{
+  const canvas=document.getElementById('chart');
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  const rect=canvas.getBoundingClientRect();
+  canvas.width=rect.width*dpr; canvas.height=rect.height*dpr;
+  ctx.scale(dpr,dpr);
+  if(!values||values.length<2){{
+    ctx.strokeStyle='#262C36';ctx.lineWidth=1.5;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(0,rect.height/2);ctx.lineTo(rect.width,rect.height/2);ctx.stroke();return;
+  }}
+  const min=Math.min(...values,0),max=Math.max(...values,0),range=max-min||1;
+  const pos=values[values.length-1]>=0;
+  const lc=pos?'#3DDC97':'#E5534B',fa=pos?'rgba(61,220,151,.22)':'rgba(229,83,75,.22)',fb=pos?'rgba(61,220,151,0)':'rgba(229,83,75,0)';
+  const pts=values.map((v,i)=>{{return{{x:(i/(values.length-1))*rect.width,y:rect.height-((v-min)/range)*rect.height}}}});
+  const g=ctx.createLinearGradient(0,0,0,rect.height);g.addColorStop(0,fa);g.addColorStop(1,fb);
+  ctx.beginPath();pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+  ctx.lineTo(pts[pts.length-1].x,rect.height);ctx.lineTo(pts[0].x,rect.height);ctx.closePath();
+  ctx.fillStyle=g;ctx.fill();
+  ctx.strokeStyle=lc;ctx.lineWidth=2;ctx.setLineDash([]);
+  ctx.beginPath();pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));ctx.stroke();
+}}
+
+/* ── Рендер таблицы ── */
+function renderTable(){{
+  const rows=filterTrades();
+  const wrap=document.getElementById('trades-wrap');
+
+  // Сводка
+  const s=calcStats(rows);
+  document.getElementById('sum-count').textContent=s.total+' '+tradesWord(s.total);
+  document.getElementById('sum-wr').textContent=s.wr!==null?'винрейт '+s.wr+'%':'винрейт —';
+  const rrEl=document.getElementById('sum-rr');
+  rrEl.textContent=s.total?fmtPnl(s.totalR):'R —';
+  rrEl.className='summary-rr '+(s.total?pnlClass(s.totalR):'');
+
+  if(!rows.length){{
+    wrap.innerHTML='<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">Нет сделок за этот период</div></div>';
+    return;
+  }}
+
+  const trs=rows.map((t,idx)=>{{
+    const isLong=t.direction==='long';
+    const rCls=pnlClass(t.result_r);
+    const oCls=t.outcome==='win'?'win':t.outcome==='loss'?'loss':'breakeven';
+    const date=(t.trade_date||t.created_at||'—').split(' ')[0];
+    const hasD=t.entry_price||t.exit_price||t.size||t.leverage;
+    const hasN=t.note&&t.note.trim();
+    const exp=hasD||hasN;
+    return `<tr class="trade-row" data-idx="${{idx}}" ${{exp?'':'style="cursor:default"'}}>
+      <td class="cell-date">${{date}}</td>
+      <td class="cell-symbol">${{t.symbol||t.asset}}</td>
+      <td><span class="dir-badge ${{isLong?'long':'short'}}">${{isLong?'лонг':'шорт'}}</span></td>
+      <td class="cell-r ${{rCls}}">${{fmtPnl(t.result_r)}}</td>
+      <td><span class="out-badge ${{oCls}}">${{outcomeLabel(t.outcome)}}</span></td>
+    </tr>
+    ${{exp?`<tr id="det-${{idx}}" style="display:none"><td colspan="5" style="padding:0 0 6px">
+      ${{hasD?`<div class="detail-inner">
+        ${{t.entry_price?`<div><div class="di-label">Вход</div><div class="di-value">${{t.entry_price}}</div></div>`:''}}
+        ${{t.exit_price?`<div><div class="di-label">Выход</div><div class="di-value">${{t.exit_price}}</div></div>`:''}}
+        ${{t.size?`<div><div class="di-label">Размер</div><div class="di-value">${{t.size}}</div></div>`:''}}
+        ${{t.leverage?`<div><div class="di-label">Leverage</div><div class="di-value">${{t.leverage}}x</div></div>`:''}}
+      </div>`:''}}</p>
+      ${{hasN?`<div class="trade-note">${{t.note}}</div>`:''}}
+    </td></tr>`:''}}`
+  }}).join('');
+
+  wrap.innerHTML=`<table class="trades-table">
+    <thead><tr><th>Дата</th><th>Тикер</th><th>Напр.</th><th>R</th><th>Итог</th></tr></thead>
+    <tbody>${{trs}}</tbody>
+  </table>`;
+
+  wrap.querySelectorAll('.trade-row').forEach(row=>{{
+    const idx=row.dataset.idx;
+    const det=document.getElementById('det-'+idx);
+    if(!det)return;
+    row.addEventListener('click',()=>{{det.style.display=det.style.display==='none'?'':'none'}});
+  }});
+}}
+
+/* ── Субфильтр ── */
+function buildSubfilter(){{
+  const sub=document.getElementById('subfilter');
+  const sel=document.getElementById('subfilter-select');
+  if(view==='month'){{
+    const months={{...new Set(ALL_TRADES.map(getMonthKey).filter(Boolean))}};
+    const keys=[...new Set(ALL_TRADES.map(getMonthKey).filter(Boolean))].sort().reverse();
+    const names={{'01':'Январь','02':'Февраль','03':'Март','04':'Апрель','05':'Май','06':'Июнь','07':'Июль','08':'Август','09':'Сентябрь','10':'Октябрь','11':'Ноябрь','12':'Декабрь'}};
+    sel.innerHTML=keys.map(k=>{{const[y,m]=k.split('-');return`<option value="${{k}}">${{names[m]||m}} ${{y}}</option>`}}).join('');
+    subfilter=keys[0]||'';sel.value=subfilter;sub.classList.add('visible');
+  }}else if(view==='year'){{
+    const keys=[...new Set(ALL_TRADES.map(getYearKey).filter(Boolean))].sort().reverse();
+    sel.innerHTML=keys.map(k=>`<option value="${{k}}">${{k}}</option>`).join('');
+    subfilter=keys[0]||'';sel.value=subfilter;sub.classList.add('visible');
+  }}else if(view==='winrate'){{
+    sel.innerHTML=`<option value="win">Прибыль</option><option value="loss">Убыток</option><option value="breakeven">Безубыток</option>`;
+    subfilter='win';sel.value=subfilter;sub.classList.add('visible');
+  }}else{{
+    subfilter='';sub.classList.remove('visible');
+  }}
+}}
+
+/* ── События ── */
+document.querySelectorAll('.tab').forEach(btn=>{{
+  btn.addEventListener('click',()=>{{
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    view=btn.dataset.view;
+    buildSubfilter();
+    renderTable();
+  }});
+}});
+
+document.getElementById('subfilter-select').addEventListener('change',e=>{{
+  subfilter=e.target.value;renderTable();
+}});
+
+document.querySelectorAll('.mode-btn').forEach(btn=>{{
+  btn.addEventListener('click',()=>{{
+    pnlMode=btn.dataset.mode;
+    document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    const riskRow=document.getElementById('risk-row');
+    riskRow.style.display=(pnlMode==='r'?'none':'');
+    document.getElementById('pnl-label').textContent=pnlMode==='r'?'Суммарный R':'Суммарный PnL';
+    updateMainPnl();
+    renderTable();
+  }});
+}});
+
+document.getElementById('risk-usd').addEventListener('input',e=>{{riskUsd=parseFloat(e.target.value)||0;renderTable();updateMainPnl()}});
+document.getElementById('risk-pct').addEventListener('input',e=>{{riskPct=parseFloat(e.target.value)||0;renderTable();updateMainPnl()}});
+
+/* ── Главный PnL ── */
+function updateMainPnl(){{
+  const v=INIT_STATS.total_r||0;
+  const el=document.getElementById('stat-pnl');
+  el.textContent=fmtPnl(v);
+  el.className='stats-pnl '+pnlClass(v);
+}}
+
+/* ── Инициализация ── */
+(function init(){{
+  // Шапка
+  const cnt=INIT_STATS.total_trades||0;
+  document.getElementById('hdr-sub').textContent=cnt+' '+tradesWord(cnt);
+  // Статы
+  updateMainPnl();
+  document.getElementById('stat-wr').textContent=cnt?INIT_STATS.winrate+'%':'—';
+  document.getElementById('stat-pf').textContent=cnt?INIT_STATS.profit_factor:'—';
+  document.getElementById('stat-cnt').textContent=cnt||'0';
+  // График
+  requestAnimationFrame(()=>drawChart(INIT_STATS.r_curve));
+  // Таблица
+  document.getElementById('risk-row').style.display='none';
+  renderTable();
+}})();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
