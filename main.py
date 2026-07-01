@@ -31,6 +31,7 @@
 """
 
 import os
+import secrets
 from datetime import datetime
 from typing import Literal, Optional
 
@@ -41,7 +42,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Trade, UserSettings, FavoriteSymbol
+from models import Base, Trade, UserSettings, FavoriteSymbol, ShareLink
 from telegram_auth import validate_telegram_init_data
 
 # Создаём таблицы в базе при первом запуске (если их ещё нет)
@@ -593,3 +594,77 @@ def delete_all_data(
     db.commit()
     return {"status": "ok", "deleted_trades": deleted_trades}
 
+
+# ---------- Шаринг журнала (публичные read-only эндпоинты) ----------
+
+@app.post("/share/generate")
+def generate_share_link(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Создаёт или возвращает существующий публичный токен пользователя."""
+    link = db.query(ShareLink).filter(ShareLink.user_id == user_id).first()
+    if link:
+        link.is_active = True
+        db.commit()
+        db.refresh(link)
+    else:
+        token = secrets.token_urlsafe(16)
+        link = ShareLink(user_id=user_id, token=token, is_active=True)
+        db.add(link)
+        db.commit()
+        db.refresh(link)
+    return {"token": link.token, "is_active": link.is_active}
+
+
+@app.delete("/share")
+def revoke_share_link(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Отзывает публичную ссылку — она перестаёт работать."""
+    link = db.query(ShareLink).filter(ShareLink.user_id == user_id).first()
+    if link:
+        link.is_active = False
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.get("/share/status")
+def get_share_status(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Возвращает текущий статус публичной ссылки пользователя."""
+    link = db.query(ShareLink).filter(ShareLink.user_id == user_id).first()
+    if not link:
+        return {"token": None, "is_active": False}
+    return {"token": link.token if link.is_active else None, "is_active": link.is_active}
+
+
+@app.get("/public/{token}/stats")
+def public_stats(token: str, db: Session = Depends(get_db)):
+    """Публичная статистика по токену — без авторизации."""
+    link = db.query(ShareLink).filter(
+        ShareLink.token == token, ShareLink.is_active == True
+    ).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Ссылка не найдена или отозвана")
+
+    trades = db.query(Trade).filter(Trade.user_id == link.user_id).order_by(Trade.trade_date).all()
+    stats = calculate_stats(trades)
+    return {"stats": stats}
+
+
+@app.get("/public/{token}/trades")
+def public_trades(token: str, db: Session = Depends(get_db)):
+    """Публичный список сделок по токену — без авторизации."""
+    link = db.query(ShareLink).filter(
+        ShareLink.token == token, ShareLink.is_active == True
+    ).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Ссылка не найдена или отозвана")
+
+    trades = db.query(Trade).filter(Trade.user_id == link.user_id)\
+        .order_by(Trade.trade_date.desc()).all()
+    return {"trades": [trade_to_dict(t) for t in trades]}
