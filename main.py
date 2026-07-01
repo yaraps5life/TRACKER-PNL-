@@ -36,6 +36,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -670,10 +671,9 @@ def public_trades(token: str, db: Session = Depends(get_db)):
     return {"trades": [trade_to_dict(t) for t in trades]}
 
 
-@app.get("/s/{token}", response_class=None)
+@app.get("/s/{token}")
 def share_page(token: str, db: Session = Depends(get_db)):
     """Публичная HTML-страница журнала — отдаётся напрямую браузеру."""
-    from fastapi.responses import HTMLResponse
 
     link = db.query(ShareLink).filter(
         ShareLink.token == token, ShareLink.is_active == True
