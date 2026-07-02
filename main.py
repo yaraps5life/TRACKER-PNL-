@@ -76,6 +76,7 @@ class NewTrade(BaseModel):
     source: Literal["manual", "auto"] = "manual"
 
     pnl_usd: Optional[float] = None
+    pnl_pct: Optional[float] = None
     symbol: Optional[str] = None
     entry_price: Optional[float] = None
     exit_price: Optional[float] = None
@@ -103,6 +104,8 @@ class UpdateTrade(BaseModel):
     leverage: Optional[float] = None
     risk_amount: Optional[float] = None
     risk_type: Optional[str] = None
+    pnl_usd: Optional[float] = None
+    pnl_pct: Optional[float] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -213,6 +216,7 @@ def trade_to_dict(t: Trade) -> dict:
         "size": t.size,
         "leverage": t.leverage,
         "pnl_usd": t.pnl_usd,
+        "pnl_pct": t.pnl_pct,
         "source": t.source,
         "note": t.note,
         "tags": t.tags or [],
@@ -368,6 +372,7 @@ def add_trade(
         result_r=new_trade.result_r,
         outcome=new_trade.outcome,
         pnl_usd=new_trade.pnl_usd,
+        pnl_pct=new_trade.pnl_pct,
         note=new_trade.note,
         trade_date=new_trade.trade_date or datetime.utcnow(),  # дата обязательна — если не передана, берём "сегодня"
         tags=new_trade.tags or [],
@@ -449,6 +454,10 @@ def update_trade(
         trade.risk_amount = update.risk_amount
     if update.risk_type is not None:
         trade.risk_type = update.risk_type
+    if update.pnl_usd is not None:
+        trade.pnl_usd = update.pnl_usd
+    if update.pnl_pct is not None:
+        trade.pnl_pct = update.pnl_pct
 
     db.commit()
     db.refresh(trade)
