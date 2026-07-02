@@ -41,6 +41,7 @@ class Trade(Base):
     # --- старые поля, оставлены для совместимости со старыми записями ---
     risk_percent = Column(Float, nullable=True)
     pnl_usd = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
 
     # --- риск на сделку (переопределяет глобальный из настроек) ---
     risk_amount = Column(Float, nullable=True)   # числовое значение риска
