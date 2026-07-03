@@ -1341,19 +1341,35 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    try:
-        data = bingx_get(
-            "/openApi/swap/v1/trade/positionHistory",
-            api_key, secret,
-            {"startTs": start_ts, "endTs": end_ts, "limit": 100}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка BingX API: {str(e)}")
+    # BingX имеет несколько эндпоинтов для истории — пробуем по очереди
+    data = None
+    last_error = ""
+    for endpoint in [
+        "/openApi/swap/v1/trade/positionHistory",
+        "/openApi/swap/v2/trade/allOrders",
+        "/openApi/swap/v1/trade/allOrders",
+    ]:
+        try:
+            result = bingx_get(endpoint, api_key, secret,
+                {"startTime": start_ts, "endTime": end_ts, "limit": 100})
+            if result.get("code") == 0:
+                data = result
+                break
+            last_error = f"[{endpoint}] код {result.get('code')}: {result.get('msg')}"
+        except Exception as e:
+            last_error = f"[{endpoint}] {str(e)}"
 
-    if data.get("code") != 0:
-        raise HTTPException(status_code=400, detail=f"BingX: {data.get('msg', 'Ошибка')}")
+    if data is None:
+        raise HTTPException(status_code=400, detail=f"BingX API не отвечает. Последняя ошибка: {last_error}")
 
-    positions = data.get("data", {}).get("positionList", []) or []
+    # BingX возвращает данные в разных полях в зависимости от эндпоинта
+    d = data.get("data", {})
+    positions = (
+        d.get("positionList") or
+        d.get("orders") or
+        d.get("list") or
+        (d if isinstance(d, list) else [])
+    )
 
     added = 0
     skipped = 0
