@@ -1347,35 +1347,45 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    # BingX имеет несколько эндпоинтов для истории — пробуем по очереди
-    data = None
-    last_error = ""
-    endpoints_to_try = [
-        ("/openApi/swap/v1/trade/positionHistory", {"startTs": start_ts, "endTs": end_ts, "limit": 100}),
-        ("/openApi/swap/v1/account/income",        {"startTime": start_ts, "endTime": end_ts, "limit": 100, "incomeType": "REALIZED_PNL"}),
-        ("/openApi/swap/v2/trade/allOrders",       {"startTime": start_ts, "endTime": end_ts, "limit": 100}),
-    ]
-    for endpoint, extra_params in endpoints_to_try:
-        try:
-            result = bingx_get(endpoint, api_key, secret, extra_params)
-            if result.get("code") == 0:
-                data = result
-                break
-            last_error = f"[{endpoint}] код {result.get('code')}: {result.get('msg')}"
-        except Exception as e:
-            last_error = f"[{endpoint}] {str(e)}"
+    # BingX /allOrders позволяет максимум 7 дней за запрос
+    # Делаем несколько запросов по 7 дней за последние 90 дней
+    CHUNK_DAYS = 7
+    CHUNK_MS = CHUNK_DAYS * 24 * 60 * 60 * 1000
+    all_positions = []
+    chunk_end = end_ts
 
-    if data is None:
-        raise HTTPException(status_code=400, detail=f"BingX API не отвечает. Последняя ошибка: {last_error}")
+    while chunk_end > start_ts:
+        chunk_start = max(chunk_end - CHUNK_MS, start_ts)
+        data = None
+        last_error = ""
+        endpoints_to_try = [
+            ("/openApi/swap/v1/trade/positionHistory", {"startTs": chunk_start, "endTs": chunk_end, "limit": 100}),
+            ("/openApi/swap/v2/trade/allOrders", {"startTime": chunk_start, "endTime": chunk_end, "limit": 100}),
+        ]
+        for endpoint, extra_params in endpoints_to_try:
+            try:
+                result = bingx_get(endpoint, api_key, secret, extra_params)
+                if result.get("code") == 0:
+                    data = result
+                    break
+                last_error = f"[{endpoint}] код {result.get('code')}: {result.get('msg')}"
+            except Exception as e:
+                last_error = f"[{endpoint}] {str(e)}"
 
-    # BingX возвращает данные в разных полях в зависимости от эндпоинта
-    d = data.get("data", {})
-    positions = (
-        d.get("positionList") or
-        d.get("orders") or
-        d.get("list") or
-        (d if isinstance(d, list) else [])
-    )
+        if data is None:
+            raise HTTPException(status_code=400, detail=f"BingX API ошибка: {last_error}")
+
+        d = data.get("data", {})
+        chunk_positions = (
+            d.get("positionList") or
+            d.get("orders") or
+            d.get("list") or
+            (d if isinstance(d, list) else [])
+        )
+        all_positions.extend(chunk_positions)
+        chunk_end = chunk_start - 1
+
+    positions = all_positions
 
     added = 0
     skipped = 0
