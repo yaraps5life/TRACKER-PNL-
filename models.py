@@ -62,13 +62,15 @@ class Trade(Base):
 
 
 class UserSettings(Base):
-    """Настройки пользователя. starting_balance оставлено для совместимости
-    (раньше использовалось для баланса в $), но больше не участвует
-    в расчётах на дашборде — там теперь сумма R."""
+    """Настройки пользователя."""
     __tablename__ = "user_settings"
 
     user_id = Column(BigInteger, primary_key=True, index=True)
     starting_balance = Column(Float, default=0.0)
+    # BingX API ключи — хранятся в открытом виде (read-only ключи)
+    bingx_api_key = Column(String, nullable=True)
+    bingx_secret_key = Column(String, nullable=True)
+    bingx_last_sync = Column(DateTime, nullable=True)  # время последней синхронизации
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -93,3 +95,20 @@ class ShareLink(Base):
     token = Column(String, nullable=False, unique=True, index=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class User(Base):
+    """Все пользователи которые открыли апп.
+    Запись создаётся при первом входе, updated_at обновляется при каждом."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    username = Column(String, nullable=True)   # @handle без @
+    language_code = Column(String, nullable=True)
+    is_premium = Column(Boolean, default=False)
+    first_seen_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    visits_count = Column(Integer, default=1)
