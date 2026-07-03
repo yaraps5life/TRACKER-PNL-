@@ -1347,31 +1347,59 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    # positionHistory — закрытые позиции с итоговым PnL (не отдельные ордера)
-    # Лимит BingX: 90 дней, но без ограничения по диапазону
+    # Сначала получаем список всех инструментов у которых есть история
+    # BingX positionHistory требует symbol — получаем все позиции пользователя
     all_positions = []
-    last_error = ""
 
     try:
-        result = bingx_get(
-            "/openApi/swap/v1/trade/positionHistory",
+        # Получаем список всех торгуемых символов через историю аккаунта
+        symbols_result = bingx_get(
+            "/openApi/swap/v2/user/income",
             api_key, secret,
-            {"startTs": start_ts, "endTs": end_ts, "limit": 100}
+            {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 1000}
         )
-        if result.get("code") == 0:
-            d = result.get("data", {})
-            all_positions = (
-                d.get("positionList") or
-                d.get("list") or
-                (d if isinstance(d, list) else [])
-            )
+        if symbols_result.get("code") == 0:
+            income_list = symbols_result.get("data", []) or []
+            symbols = list(set(item.get("symbol") for item in income_list if item.get("symbol")))
         else:
-            last_error = f"код {result.get('code')}: {result.get('msg')}"
-    except Exception as e:
-        last_error = str(e)
+            symbols = []
+    except Exception:
+        symbols = []
 
-    if last_error and not all_positions:
-        raise HTTPException(status_code=400, detail=f"BingX positionHistory: {last_error}")
+    # Если не получили символы через income — пробуем через allOrders без symbol
+    if not symbols:
+        try:
+            # Получаем уникальные символы из истории ордеров (по 7 дней)
+            CHUNK_MS = 7 * 24 * 60 * 60 * 1000
+            chunk_end = end_ts
+            while chunk_end > start_ts and not symbols:
+                chunk_start = max(chunk_end - CHUNK_MS, start_ts)
+                r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret,
+                    {"startTime": chunk_start, "endTime": chunk_end, "limit": 500})
+                if r.get("code") == 0:
+                    orders = r.get("data", {}).get("orders") or []
+                    symbols = list(set(o.get("symbol") for o in orders if o.get("symbol")))
+                chunk_end = chunk_start - 1
+        except Exception:
+            pass
+
+    if not symbols:
+        raise HTTPException(status_code=400, detail="Не удалось получить список торгуемых инструментов из BingX")
+
+    # Теперь запрашиваем историю позиций по каждому символу
+    for symbol in symbols:
+        try:
+            result = bingx_get(
+                "/openApi/swap/v1/trade/positionHistory",
+                api_key, secret,
+                {"symbol": symbol, "startTs": start_ts, "endTs": end_ts, "limit": 100}
+            )
+            if result.get("code") == 0:
+                d = result.get("data", {})
+                sym_positions = d.get("positionList") or d.get("list") or []
+                all_positions.extend(sym_positions)
+        except Exception:
+            continue
 
     positions = all_positions
 
