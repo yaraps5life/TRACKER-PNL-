@@ -1414,7 +1414,8 @@ def bingx_sync(
         entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0) or None
         close_price = float(pos.get("closePrice") or 0) or None
         size = float(pos.get("positionAmt") or pos.get("amount") or 0) or None
-        leverage = float(pos.get("leverage") or 1)
+        leverage_raw = pos.get("leverage") or "1"
+        leverage = float(str(leverage_raw).replace("X", "").replace("x", "") or 1)
 
         # Определяем исход
         if pnl_usd > 0:
