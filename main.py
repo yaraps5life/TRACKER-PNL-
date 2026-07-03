@@ -1344,14 +1344,14 @@ def bingx_sync(
     # BingX имеет несколько эндпоинтов для истории — пробуем по очереди
     data = None
     last_error = ""
-    for endpoint in [
-        "/openApi/swap/v1/trade/positionHistory",
-        "/openApi/swap/v2/trade/allOrders",
-        "/openApi/swap/v1/trade/allOrders",
-    ]:
+    endpoints_to_try = [
+        ("/openApi/swap/v1/trade/positionHistory", {"startTs": start_ts, "endTs": end_ts, "limit": 100}),
+        ("/openApi/swap/v1/account/income",        {"startTime": start_ts, "endTime": end_ts, "limit": 100, "incomeType": "REALIZED_PNL"}),
+        ("/openApi/swap/v2/trade/allOrders",       {"startTime": start_ts, "endTime": end_ts, "limit": 100}),
+    ]
+    for endpoint, extra_params in endpoints_to_try:
         try:
-            result = bingx_get(endpoint, api_key, secret,
-                {"startTime": start_ts, "endTime": end_ts, "limit": 100})
+            result = bingx_get(endpoint, api_key, secret, extra_params)
             if result.get("code") == 0:
                 data = result
                 break
