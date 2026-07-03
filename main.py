@@ -1347,43 +1347,31 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    # BingX /allOrders позволяет максимум 7 дней за запрос
-    # Делаем несколько запросов по 7 дней за последние 90 дней
-    CHUNK_DAYS = 7
-    CHUNK_MS = CHUNK_DAYS * 24 * 60 * 60 * 1000
+    # positionHistory — закрытые позиции с итоговым PnL (не отдельные ордера)
+    # Лимит BingX: 90 дней, но без ограничения по диапазону
     all_positions = []
-    chunk_end = end_ts
+    last_error = ""
 
-    while chunk_end > start_ts:
-        chunk_start = max(chunk_end - CHUNK_MS, start_ts)
-        data = None
-        last_error = ""
-        endpoints_to_try = [
-            ("/openApi/swap/v1/trade/positionHistory", {"startTs": chunk_start, "endTs": chunk_end, "limit": 100}),
-            ("/openApi/swap/v2/trade/allOrders", {"startTime": chunk_start, "endTime": chunk_end, "limit": 100}),
-        ]
-        for endpoint, extra_params in endpoints_to_try:
-            try:
-                result = bingx_get(endpoint, api_key, secret, extra_params)
-                if result.get("code") == 0:
-                    data = result
-                    break
-                last_error = f"[{endpoint}] код {result.get('code')}: {result.get('msg')}"
-            except Exception as e:
-                last_error = f"[{endpoint}] {str(e)}"
-
-        if data is None:
-            raise HTTPException(status_code=400, detail=f"BingX API ошибка: {last_error}")
-
-        d = data.get("data", {})
-        chunk_positions = (
-            d.get("positionList") or
-            d.get("orders") or
-            d.get("list") or
-            (d if isinstance(d, list) else [])
+    try:
+        result = bingx_get(
+            "/openApi/swap/v1/trade/positionHistory",
+            api_key, secret,
+            {"startTs": start_ts, "endTs": end_ts, "limit": 100}
         )
-        all_positions.extend(chunk_positions)
-        chunk_end = chunk_start - 1
+        if result.get("code") == 0:
+            d = result.get("data", {})
+            all_positions = (
+                d.get("positionList") or
+                d.get("list") or
+                (d if isinstance(d, list) else [])
+            )
+        else:
+            last_error = f"код {result.get('code')}: {result.get('msg')}"
+    except Exception as e:
+        last_error = str(e)
+
+    if last_error and not all_positions:
+        raise HTTPException(status_code=400, detail=f"BingX positionHistory: {last_error}")
 
     positions = all_positions
 
@@ -1407,10 +1395,18 @@ def bingx_sync(
             continue
 
         # Маппинг BingX → наша модель
-        symbol = pos.get("symbol", "").replace("-USDT", "USDT")
+        # Чистим тикер — убираем лишние суффиксы BingX
+        raw_symbol = pos.get("symbol", "")
+        symbol = raw_symbol.replace("-USDT", "USDT").replace("-USDC", "USDC").replace("-SWAP", "")
+
         side = pos.get("positionSide", "LONG").upper()
         direction = "long" if side == "LONG" else "short"
         pnl_usd = float(pos.get("realisedPnl") or pos.get("profit") or 0)
+
+        # Пропускаем нулевые — это незакрытые или частичные позиции
+        if pnl_usd == 0:
+            skipped += 1
+            continue
         entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0) or None
         close_price = float(pos.get("closePrice") or 0) or None
         size = float(pos.get("positionAmt") or pos.get("amount") or 0) or None
