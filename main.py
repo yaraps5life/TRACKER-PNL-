@@ -31,6 +31,7 @@
 """
 
 import os
+import json
 import secrets
 from datetime import datetime
 from typing import Literal, Optional
@@ -43,7 +44,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Trade, UserSettings, FavoriteSymbol, ShareLink
+from models import Base, Trade, UserSettings, FavoriteSymbol, ShareLink, User
 from telegram_auth import validate_telegram_init_data
 
 # Создаём таблицы в базе при первом запуске (если их ещё нет)
@@ -130,6 +131,43 @@ def get_current_user_id(authorization: str = Header(...)) -> int:
         raise HTTPException(status_code=401, detail="Подпись Telegram недействительна")
 
     return user_data["id"]
+
+
+def get_current_user_data(authorization: str = Header(...)) -> dict:
+    """Возвращает полный user_data из Telegram initData."""
+    if not authorization.startswith("tma "):
+        raise HTTPException(status_code=401, detail="Неверный формат авторизации")
+    init_data = authorization[4:]
+    user_data = validate_telegram_init_data(init_data, BOT_TOKEN)
+    if user_data is None:
+        raise HTTPException(status_code=401, detail="Подпись Telegram недействительна")
+    return user_data
+
+
+def upsert_user(user_data: dict, db: Session):
+    """Создаёт запись пользователя при первом входе или обновляет last_seen_at."""
+    uid = user_data.get("id")
+    if not uid:
+        return
+    user = db.query(User).filter(User.user_id == uid).first()
+    if user:
+        user.last_seen_at = datetime.utcnow()
+        user.visits_count = (user.visits_count or 0) + 1
+        # Обновляем имя если изменилось
+        user.first_name = user_data.get("first_name") or user.first_name
+        user.last_name = user_data.get("last_name") or user.last_name
+        user.username = user_data.get("username") or user.username
+    else:
+        user = User(
+            user_id=uid,
+            first_name=user_data.get("first_name"),
+            last_name=user_data.get("last_name"),
+            username=user_data.get("username"),
+            language_code=user_data.get("language_code"),
+            is_premium=bool(user_data.get("is_premium", False)),
+        )
+        db.add(user)
+    db.commit()
 
 
 # ---------- Настройки пользователя (стартовый баланс) ----------
@@ -262,13 +300,14 @@ def update_settings(
 @app.get("/stats/summary")
 def get_summary(
     user_id: int = Depends(get_current_user_id),
+    user_data: dict = Depends(get_current_user_data),
     db: Session = Depends(get_db),
     year: Optional[int] = None,
     month: Optional[int] = None,
     result: Optional[Literal["win", "loss", "breakeven"]] = None,
 ):
-    """Сводка для главного экрана: суммарный R, график R.
-    Поддерживает фильтры year, month, result для фильтрованного дашборда."""
+    """Сводка для главного экрана. Заодно фиксирует визит пользователя."""
+    upsert_user(user_data, db)
     query = db.query(Trade).filter(Trade.user_id == user_id)
 
     if year:
@@ -1120,3 +1159,268 @@ function updateMainPnl(){{
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+# ---------- Просмотр пользователей (только для владельца) ----------
+
+ADMIN_USER_ID = 778995374  # твой Telegram ID
+
+@app.get("/admin/users")
+def admin_users(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    days: Optional[int] = None,        # активные за последние N дней
+    premium: Optional[bool] = None,    # только Telegram Premium
+    limit: int = 100,
+):
+    """Список пользователей — только для владельца."""
+    if user_id != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    query = db.query(User)
+
+    if days is not None:
+        from datetime import timedelta
+        since = datetime.utcnow() - timedelta(days=days)
+        query = query.filter(User.last_seen_at >= since)
+
+    if premium is not None:
+        query = query.filter(User.is_premium == premium)
+
+    users = query.order_by(User.last_seen_at.desc()).limit(limit).all()
+
+    return {
+        "total": query.count(),
+        "users": [{
+            "user_id": u.user_id,
+            "first_name": u.first_name,
+            "username": u.username,
+            "is_premium": u.is_premium,
+            "language_code": u.language_code,
+            "first_seen_at": u.first_seen_at.strftime("%d.%m.%Y") if u.first_seen_at else None,
+            "last_seen_at": u.last_seen_at.strftime("%d.%m.%Y %H:%M") if u.last_seen_at else None,
+            "visits_count": u.visits_count,
+        } for u in users]
+    }
+
+
+@app.get("/admin/stats")
+def admin_stats(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Общая статистика по всем пользователям."""
+    if user_id != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    from datetime import timedelta
+    now = datetime.utcnow()
+
+    total_users = db.query(User).count()
+    dau = db.query(User).filter(User.last_seen_at >= now - timedelta(days=1)).count()
+    wau = db.query(User).filter(User.last_seen_at >= now - timedelta(days=7)).count()
+    mau = db.query(User).filter(User.last_seen_at >= now - timedelta(days=30)).count()
+    total_trades = db.query(Trade).count()
+    premium_users = db.query(User).filter(User.is_premium == True).count()
+
+    return {
+        "total_users": total_users,
+        "dau": dau,
+        "wau": wau,
+        "mau": mau,
+        "total_trades": total_trades,
+        "premium_users": premium_users,
+    }
+
+
+# ---------- BingX интеграция ----------
+
+import hmac as hmac_lib
+import hashlib
+import urllib.request
+import urllib.parse
+
+BINGX_BASE = "https://open-api.bingx.com"
+
+
+def bingx_sign(params: dict, secret: str) -> str:
+    qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac_lib.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+
+def bingx_get(path: str, api_key: str, secret: str, extra: dict = None) -> dict:
+    params = {"timestamp": int(datetime.utcnow().timestamp() * 1000)}
+    if extra:
+        params.update(extra)
+    params["signature"] = bingx_sign(params, secret)
+    url = BINGX_BASE + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"X-BX-APIKEY": api_key})
+    resp = urllib.request.urlopen(req, timeout=15)
+    return json.loads(resp.read())
+
+
+@app.post("/exchange/bingx/connect")
+def bingx_connect(
+    body: dict,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет BingX API ключи и проверяет подключение."""
+    api_key = body.get("api_key", "").strip()
+    secret_key = body.get("secret_key", "").strip()
+
+    if not api_key or not secret_key:
+        raise HTTPException(status_code=400, detail="Укажи оба ключа")
+
+    # Проверяем ключи — запрашиваем баланс
+    try:
+        data = bingx_get("/openApi/swap/v2/user/balance", api_key, secret_key)
+        if data.get("code") != 0:
+            raise HTTPException(status_code=400, detail=f"BingX: {data.get('msg', 'Ошибка')}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не удалось подключиться к BingX: {str(e)}")
+
+    # Сохраняем ключи
+    settings = get_or_create_settings(user_id, db)
+    settings.bingx_api_key = api_key
+    settings.bingx_secret_key = secret_key
+    db.commit()
+
+    balance = data.get("data", {}).get("balance", {})
+    return {
+        "status": "connected",
+        "balance": balance.get("equity", "—"),
+        "currency": "USDT",
+    }
+
+
+@app.delete("/exchange/bingx/disconnect")
+def bingx_disconnect(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Удаляет BingX API ключи."""
+    settings = get_or_create_settings(user_id, db)
+    settings.bingx_api_key = None
+    settings.bingx_secret_key = None
+    settings.bingx_last_sync = None
+    db.commit()
+    return {"status": "disconnected"}
+
+
+@app.get("/exchange/bingx/status")
+def bingx_status(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Возвращает статус подключения BingX."""
+    settings = get_or_create_settings(user_id, db)
+    connected = bool(settings.bingx_api_key and settings.bingx_secret_key)
+    return {
+        "connected": connected,
+        "last_sync": settings.bingx_last_sync.strftime("%d.%m.%Y %H:%M") if settings.bingx_last_sync else None,
+    }
+
+
+@app.post("/exchange/bingx/sync")
+def bingx_sync(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Синхронизирует закрытые позиции с BingX."""
+    settings = get_or_create_settings(user_id, db)
+    if not settings.bingx_api_key or not settings.bingx_secret_key:
+        raise HTTPException(status_code=400, detail="BingX не подключён")
+
+    api_key = settings.bingx_api_key
+    secret = settings.bingx_secret_key
+
+    # Берём позиции за последние 90 дней (лимит BingX)
+    end_ts = int(datetime.utcnow().timestamp() * 1000)
+    start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
+
+    try:
+        data = bingx_get(
+            "/openApi/swap/v1/trade/positionHistory",
+            api_key, secret,
+            {"startTs": start_ts, "endTs": end_ts, "limit": 100}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка BingX API: {str(e)}")
+
+    if data.get("code") != 0:
+        raise HTTPException(status_code=400, detail=f"BingX: {data.get('msg', 'Ошибка')}")
+
+    positions = data.get("data", {}).get("positionList", []) or []
+
+    added = 0
+    skipped = 0
+
+    for pos in positions:
+        # Проверяем нет ли уже такой сделки (по order ID)
+        order_id = str(pos.get("positionId") or pos.get("orderId") or "")
+        if not order_id:
+            continue
+
+        existing = db.query(Trade).filter(
+            Trade.user_id == user_id,
+            Trade.source == "auto",
+            Trade.asset == order_id
+        ).first()
+
+        if existing:
+            skipped += 1
+            continue
+
+        # Маппинг BingX → наша модель
+        symbol = pos.get("symbol", "").replace("-USDT", "USDT")
+        side = pos.get("positionSide", "LONG").upper()
+        direction = "long" if side == "LONG" else "short"
+        pnl_usd = float(pos.get("realisedPnl") or pos.get("profit") or 0)
+        entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0) or None
+        close_price = float(pos.get("closePrice") or 0) or None
+        size = float(pos.get("positionAmt") or pos.get("amount") or 0) or None
+        leverage = float(pos.get("leverage") or 1)
+
+        # Определяем исход
+        if pnl_usd > 0:
+            outcome = "win"
+        elif pnl_usd < 0:
+            outcome = "loss"
+        else:
+            outcome = "breakeven"
+
+        # Дата закрытия
+        close_ts = pos.get("updateTime") or pos.get("closeTime")
+        trade_date = datetime.utcfromtimestamp(int(close_ts) / 1000) if close_ts else datetime.utcnow()
+
+        trade = Trade(
+            user_id=user_id,
+            asset=order_id,   # временно храним order_id в asset для дедупликации
+            symbol=symbol,
+            direction=direction,
+            outcome=outcome,
+            pnl_usd=round(pnl_usd, 4),
+            entry_price=entry_price,
+            exit_price=close_price,
+            size=size,
+            leverage=leverage,
+            source="auto",
+            trade_date=trade_date,
+            tags=[],
+        )
+        db.add(trade)
+        added += 1
+
+    # Обновляем время последней синхронизации
+    settings.bingx_last_sync = datetime.utcnow()
+    db.commit()
+
+    return {
+        "status": "ok",
+        "added": added,
+        "skipped": skipped,
+        "total_fetched": len(positions),
+    }
