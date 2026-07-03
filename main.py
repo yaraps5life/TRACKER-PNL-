@@ -1244,17 +1244,23 @@ BINGX_BASE = "https://open-api.bingx.com"
 
 
 def bingx_sign(params: dict, secret: str) -> str:
-    qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    # BingX требует строку параметров БЕЗ сортировки, в оригинальном порядке
+    # timestamp должен быть последним
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
     return hmac_lib.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 
 def bingx_get(path: str, api_key: str, secret: str, extra: dict = None) -> dict:
-    params = {"timestamp": int(datetime.utcnow().timestamp() * 1000)}
+    params = {}
     if extra:
         params.update(extra)
+    params["timestamp"] = int(datetime.utcnow().timestamp() * 1000)
     params["signature"] = bingx_sign(params, secret)
     url = BINGX_BASE + path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"X-BX-APIKEY": api_key})
+    req = urllib.request.Request(url, headers={
+        "X-BX-APIKEY": api_key,
+        "Content-Type": "application/json",
+    })
     resp = urllib.request.urlopen(req, timeout=15)
     return json.loads(resp.read())
 
