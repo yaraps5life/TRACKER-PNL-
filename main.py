@@ -1346,42 +1346,37 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    # Пробуем все известные эндпоинты для истории позиций BingX USDT-M
+    # Шаг 1: получаем список символов через income
+    symbols = []
+    try:
+        r = bingx_get("/openApi/swap/v2/user/income", api_key, secret,
+            {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 1000})
+        if r.get("code") == 0:
+            symbols = list(set(
+                item.get("symbol") for item in (r.get("data") or [])
+                if item.get("symbol")
+            ))
+    except Exception:
+        pass
+
+    # Шаг 2: для каждого символа запрашиваем positionHistory
     all_positions = []
-    tried = []
-
-    endpoints = [
-        # Основной эндпоинт истории позиций — без временного диапазона, с пагинацией
-        ("positionHistory_page", "/openApi/swap/v1/trade/positionHistory",
-            {"pageIndex": 1, "pageSize": 100}),
-        # С временным диапазоном startTime/endTime
-        ("positionHistory_time", "/openApi/swap/v1/trade/positionHistory",
-            {"startTime": start_ts, "endTime": end_ts, "limit": 100}),
-        # Новая версия
-        ("positionHistory_v2", "/openApi/swap/v2/trade/positionHistory",
-            {"startTime": start_ts, "endTime": end_ts, "limit": 100}),
-        # История ордеров (FILLED)
-        ("historyOrders", "/openApi/swap/v1/trade/historyOrders",
-            {"status": "FILLED", "startTime": start_ts, "endTime": end_ts, "limit": 100}),
-    ]
-
-    for name, endpoint, params in endpoints:
+    for sym in symbols:
         try:
-            r = bingx_get(endpoint, api_key, secret, params)
-            code = r.get("code", -1)
-            d = r.get("data", {})
-            items = (
-                d.get("positionList") or d.get("orders") or
-                d.get("list") or (d if isinstance(d, list) else [])
-            )
-            tried.append(f"{name}:code={code},count={len(items)}")
-            if code == 0 and items:
-                all_positions = items
-                break
-        except Exception as e:
-            tried.append(f"{name}:err={str(e)[:50]}")
+            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
+                {"symbol": sym, "pageIndex": 1, "pageSize": 100})
+            if r.get("code") == 0:
+                d = r.get("data", {})
+                items = d.get("positionList") or d.get("list") or []
+                # Фильтруем по дате
+                for item in items:
+                    ts = int(item.get("updateTime") or item.get("closeTime") or 0)
+                    if ts >= start_ts:
+                        all_positions.append(item)
+        except Exception:
+            continue
 
-    # Фолбэк через income
+    # Шаг 3: если positionHistory пустой — используем income напрямую
     if not all_positions:
         try:
             r = bingx_get("/openApi/swap/v2/user/income", api_key, secret,
@@ -1401,12 +1396,13 @@ def bingx_sync(
                             "symbol": item.get("symbol", ""),
                             "realisedPnl": pnl,
                             "updateTime": item.get("time"),
-                            "_income": True,
                         }
                 all_positions = list(income_map.values())
-                tried.append(f"income_fallback:count={len(all_positions)}")
-        except Exception as e:
-            tried.append(f"income_fallback:err={str(e)[:50]}")
+        except Exception:
+            pass
+
+    if not all_positions:
+        raise HTTPException(status_code=400, detail="Не удалось получить позиции из BingX")
 
     # Сортируем по дате DESC
     all_positions.sort(
@@ -1418,7 +1414,7 @@ def bingx_sync(
     skipped = 0
 
     for pos in all_positions:
-        order_id = str(pos.get("positionId") or pos.get("orderId") or pos.get("id") or "")
+        order_id = str(pos.get("positionId") or pos.get("orderId") or "")
         if not order_id:
             continue
 
@@ -1436,13 +1432,13 @@ def bingx_sync(
             skipped += 1
             continue
 
-        symbol_clean = (pos.get("symbol") or "").replace("-USDT", "USDT").replace("-SWAP", "")
-        side = str(pos.get("positionSide") or pos.get("side") or "LONG").upper()
+        symbol_clean = (pos.get("symbol") or "").replace("-USDT","USDT").replace("-SWAP","")
+        side = str(pos.get("positionSide") or "LONG").upper()
         direction = "short" if "SHORT" in side else "long"
         outcome = "win" if pnl_usd > 0 else "loss"
 
-        def safe_float(val):
-            try: return float(val) or None
+        def safe_float(v):
+            try: return float(v) or None
             except: return None
 
         entry_price = safe_float(pos.get("avgPrice") or pos.get("entryPrice"))
@@ -1454,7 +1450,7 @@ def bingx_sync(
             leverage = None
 
         close_ts = pos.get("updateTime") or pos.get("closeTime")
-        trade_date = datetime.utcfromtimestamp(int(close_ts) / 1000) if close_ts else datetime.utcnow()
+        trade_date = datetime.utcfromtimestamp(int(close_ts)/1000) if close_ts else datetime.utcnow()
 
         trade = Trade(
             user_id=user_id,
@@ -1482,6 +1478,7 @@ def bingx_sync(
         "added": added,
         "skipped": skipped,
         "total_fetched": len(all_positions),
-        "debug": " | ".join(tried),
+        "symbols": symbols,
+        "debug": f"символов: {len(symbols)}, позиций: {len(all_positions)}",
     }
 
