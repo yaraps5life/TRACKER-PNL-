@@ -1480,4 +1480,6 @@ def bingx_sync(
         "added": added,
         "skipped": skipped,
         "total_fetched": len(positions),
+        "symbols_found": symbols if symbols else [],
+        "debug": f"Нашли {len(symbols)} символов, {len(positions)} позиций",
     }
