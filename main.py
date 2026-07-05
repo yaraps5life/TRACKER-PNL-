@@ -1347,123 +1347,78 @@ def bingx_sync(
     end_ts = int(datetime.utcnow().timestamp() * 1000)
     start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
 
-    # Сначала получаем список всех инструментов у которых есть история
-    # BingX positionHistory требует symbol — получаем все позиции пользователя
-    all_positions = []
+    # Используем /user/income с incomeType=REALIZED_PNL
+    # Этот эндпоинт уже доказал что работает (нашёл символы на предыдущем шаге)
+    income_list = []
+    last_error = ""
 
     try:
-        # Получаем список всех торгуемых символов через историю аккаунта
-        symbols_result = bingx_get(
+        result = bingx_get(
             "/openApi/swap/v2/user/income",
             api_key, secret,
             {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 1000}
         )
-        if symbols_result.get("code") == 0:
-            income_list = symbols_result.get("data", []) or []
-            symbols = list(set(item.get("symbol") for item in income_list if item.get("symbol")))
+        if result.get("code") == 0:
+            income_list = result.get("data", []) or []
         else:
-            symbols = []
-    except Exception:
-        symbols = []
+            last_error = f"код {result.get('code')}: {result.get('msg')}"
+    except Exception as e:
+        last_error = str(e)
 
-    # Если не получили символы через income — пробуем через allOrders без symbol
-    if not symbols:
-        try:
-            # Получаем уникальные символы из истории ордеров (по 7 дней)
-            CHUNK_MS = 7 * 24 * 60 * 60 * 1000
-            chunk_end = end_ts
-            while chunk_end > start_ts and not symbols:
-                chunk_start = max(chunk_end - CHUNK_MS, start_ts)
-                r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret,
-                    {"startTime": chunk_start, "endTime": chunk_end, "limit": 500})
-                if r.get("code") == 0:
-                    orders = r.get("data", {}).get("orders") or []
-                    symbols = list(set(o.get("symbol") for o in orders if o.get("symbol")))
-                chunk_end = chunk_start - 1
-        except Exception:
-            pass
+    if last_error and not income_list:
+        raise HTTPException(status_code=400, detail=f"BingX income: {last_error}")
 
-    if not symbols:
-        raise HTTPException(status_code=400, detail="Не удалось получить список торгуемых инструментов из BingX")
-
-    # Теперь запрашиваем историю позиций по каждому символу
-    for symbol in symbols:
-        try:
-            result = bingx_get(
-                "/openApi/swap/v1/trade/positionHistory",
-                api_key, secret,
-                {"symbol": symbol, "startTs": start_ts, "endTs": end_ts, "limit": 100}
-            )
-            if result.get("code") == 0:
-                d = result.get("data", {})
-                sym_positions = d.get("positionList") or d.get("list") or []
-                all_positions.extend(sym_positions)
-        except Exception:
+    # Группируем по tradeId — одна запись на позицию
+    positions_map = {}
+    for item in income_list:
+        trade_id = str(item.get("tradeId") or item.get("id") or "")
+        symbol = item.get("symbol", "")
+        if not trade_id or not symbol:
             continue
+        pnl = float(item.get("income") or 0)
+        if pnl == 0:
+            continue
+        if trade_id in positions_map:
+            positions_map[trade_id]["pnl"] += pnl
+        else:
+            positions_map[trade_id] = {
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "pnl": pnl,
+                "time": item.get("time") or item.get("updateTime"),
+            }
 
-    positions = all_positions
+    positions = list(positions_map.values())
+    symbols = list(set(p["symbol"] for p in positions))
 
     added = 0
     skipped = 0
 
     for pos in positions:
-        # Проверяем нет ли уже такой сделки (по order ID)
-        order_id = str(pos.get("positionId") or pos.get("orderId") or "")
-        if not order_id:
-            continue
+        order_id = pos["trade_id"]
 
         existing = db.query(Trade).filter(
             Trade.user_id == user_id,
             Trade.source == "auto",
             Trade.asset == order_id
         ).first()
-
         if existing:
             skipped += 1
             continue
 
-        # Маппинг BingX → наша модель
-        # Чистим тикер — убираем лишние суффиксы BingX
-        raw_symbol = pos.get("symbol", "")
-        symbol = raw_symbol.replace("-USDT", "USDT").replace("-USDC", "USDC").replace("-SWAP", "")
-
-        side = pos.get("positionSide", "LONG").upper()
-        direction = "long" if side == "LONG" else "short"
-        pnl_usd = float(pos.get("realisedPnl") or pos.get("profit") or 0)
-
-        # Пропускаем нулевые — это незакрытые или частичные позиции
-        if pnl_usd == 0:
-            skipped += 1
-            continue
-        entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0) or None
-        close_price = float(pos.get("closePrice") or 0) or None
-        size = float(pos.get("positionAmt") or pos.get("amount") or 0) or None
-        leverage_raw = pos.get("leverage") or "1"
-        leverage = float(str(leverage_raw).replace("X", "").replace("x", "") or 1)
-
-        # Определяем исход
-        if pnl_usd > 0:
-            outcome = "win"
-        elif pnl_usd < 0:
-            outcome = "loss"
-        else:
-            outcome = "breakeven"
-
-        # Дата закрытия
-        close_ts = pos.get("updateTime") or pos.get("closeTime")
+        pnl_usd = pos["pnl"]
+        symbol_clean = pos["symbol"].replace("-USDT", "USDT").replace("-USDC", "USDC").replace("-SWAP", "")
+        outcome = "win" if pnl_usd > 0 else "loss" if pnl_usd < 0 else "breakeven"
+        close_ts = pos.get("time")
         trade_date = datetime.utcfromtimestamp(int(close_ts) / 1000) if close_ts else datetime.utcnow()
 
         trade = Trade(
             user_id=user_id,
-            asset=order_id,   # временно храним order_id в asset для дедупликации
-            symbol=symbol,
-            direction=direction,
+            asset=order_id,
+            symbol=symbol_clean,
+            direction="long",
             outcome=outcome,
             pnl_usd=round(pnl_usd, 4),
-            entry_price=entry_price,
-            exit_price=close_price,
-            size=size,
-            leverage=leverage,
             source="auto",
             trade_date=trade_date,
             tags=[],
@@ -1471,7 +1426,6 @@ def bingx_sync(
         db.add(trade)
         added += 1
 
-    # Обновляем время последней синхронизации
     settings.bingx_last_sync = datetime.utcnow()
     db.commit()
 
@@ -1480,6 +1434,6 @@ def bingx_sync(
         "added": added,
         "skipped": skipped,
         "total_fetched": len(positions),
-        "symbols_found": symbols if symbols else [],
-        "debug": f"Нашли {len(symbols)} символов, {len(positions)} позиций",
+        "symbols_found": symbols,
+        "debug": f"income записей: {len(income_list)}, уникальных позиций: {len(positions)}, символов: {len(symbols)}",
     }
