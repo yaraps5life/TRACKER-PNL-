@@ -1438,15 +1438,12 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # Дамп positionHistory — смотрим все ключи первой позиции
+    # positionHistory пуст — entry_price вычисляем из exit_price и pnl
+    # Short: entry = exit + pnl/size_usd * exit
+    # Long:  entry = exit - pnl/size_usd * exit
+    # Точнее: entry = exit * (1 - pnl/notional) для лонга, обратное для шорта
+    # Но проще: entry = exit ± pnl/qty (qty в базовой валюте)
     position_data = {}
-    sym = list(symbols)[0] if symbols else "BTC-USDT"
-    r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret, {
-        "symbol": sym, "startTs": start_ts, "endTs": end_ts, "pageIndex": 1, "pageSize": 3,
-    })
-    d = r.get("data") or {}
-    items = d.get("positionList") or d.get("list") or (d if isinstance(d, list) else [])
-    raise HTTPException(status_code=400, detail=f"code={r.get('code')} items={len(items)} sample={str(items[0]) if items else 'EMPTY'}")
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
@@ -1508,32 +1505,26 @@ def bingx_sync(
         outcome = "win" if pnl_usd > 0 else "loss"
 
         # Цены: fillPrice / price — реальная цена исполнения
-        # exit_price — цена исполнения из fillHistory
+        # exit_price — цена исполнения из fillHistory (поле price)
         exit_price = safe_float(fill.get("price") or fill.get("fillPrice") or fill.get("avgPrice"))
 
-        # entry_price и leverage — ищем в positionHistory по символу и времени
+        # qty в базовой валюте (BTC/ETH/etc) — поле qty
+        qty_base = safe_float(fill.get("qty"))
+
+        # entry_price вычисляем из exit_price, pnl и qty:
+        # Для лонга:  pnl = (exit - entry) * qty  =>  entry = exit - pnl/qty
+        # Для шорта:  pnl = (entry - exit) * qty  =>  entry = exit + pnl/qty
         entry_price = None
-        leverage = None
-        sym_positions = position_data.get(symbol_raw) or position_data.get(symbol_clean) or []
-        if sym_positions:
-            fill_ts_ms = 0
-            try:
-                from datetime import timezone
-                ft = fill.get("filledTime") or ""
-                if ft:
-                    dt = datetime.fromisoformat(str(ft).replace("Z", "+00:00"))
-                    fill_ts_ms = int(dt.astimezone(timezone.utc).timestamp() * 1000)
-            except Exception:
-                pass
-            # Берём позицию, время закрытия которой ближайшее к времени филла
-            best = min(sym_positions,
-                key=lambda p: abs(p["closeTime"] - fill_ts_ms) if p["closeTime"] else 999999999999)
-            entry_price = best.get("avgPrice")
-            lev_raw = best.get("leverage")
-            try:
-                leverage = float(str(lev_raw).replace("X","").replace("x","")) if lev_raw else None
-            except Exception:
-                leverage = None
+        if exit_price and qty_base and qty_base > 0 and pnl_usd is not None:
+            if direction == "long":
+                entry_price = round(exit_price - pnl_usd / qty_base, 6)
+            else:
+                entry_price = round(exit_price + pnl_usd / qty_base, 6)
+            # Санити-чек: цена должна быть положительной
+            if entry_price <= 0:
+                entry_price = None
+
+        leverage = None  # positionHistory недоступен для этого аккаунта
         size = safe_float(fill.get("quoteQty") or fill.get("filledVolume") or fill.get("qty") or fill.get("quantity"))
         # leverage уже взят из positionHistory выше
 
