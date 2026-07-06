@@ -1437,6 +1437,11 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
+    # Показываем структуру первого филла для отладки
+    if all_fills:
+        sample = all_fills[0]
+        raise HTTPException(status_code=400, detail=f"SAMPLE FILL: {dict(sample)}")
+
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
         key=lambda f: int(f.get("time") or f.get("createTime") or f.get("updateTime") or 0),
