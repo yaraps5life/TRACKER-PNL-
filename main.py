@@ -224,10 +224,11 @@ def calculate_stats(trades: list[Trade]) -> dict:
                 break
 
     # График R — накопительная сумма по сделкам в хронологическом порядке
+    # Если result_r не заполнен (авто-синхронизация без риска) — используем pnl_usd
     r_curve = [0]
     running = 0
     for t in trades:
-        running += t.result_r or 0
+        running += t.result_r if t.result_r is not None else (t.pnl_usd or 0)
         r_curve.append(round(running, 2))
 
     return {
@@ -1437,9 +1438,32 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
+    # Подтягиваем цены открытия через allOrders (fillHistory их не содержит)
+    # Строим словарь orderId -> avgPrice из ордеров на открытие (side=BUY для LONG, SELL для SHORT)
+    open_prices = {}
+    for sym in symbols:
+        try:
+            r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret, {
+                "symbol": sym,
+                "startTime": start_ts,
+                "endTime": end_ts,
+                "limit": 200,
+            })
+            if r.get("code") == 0:
+                orders = (r.get("data") or {})
+                if isinstance(orders, dict):
+                    orders = orders.get("orders") or []
+                for o in (orders if isinstance(orders, list) else []):
+                    oid = str(o.get("orderId") or "")
+                    price = safe_float(o.get("avgPrice") or o.get("price"))
+                    if oid and price:
+                        open_prices[oid] = price
+        except Exception:
+            continue
+
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
-        key=lambda f: int(f.get("time") or f.get("createTime") or f.get("updateTime") or 0),
+        key=lambda f: str(f.get("filledTime") or f.get("time") or f.get("createTime") or ""),
         reverse=True
     )
 
@@ -1497,8 +1521,16 @@ def bingx_sync(
         outcome = "win" if pnl_usd > 0 else "loss"
 
         # Цены: fillPrice / price — реальная цена исполнения
-        entry_price = safe_float(fill.get("openPrice") or fill.get("avgOpenPrice"))
-        exit_price = safe_float(fill.get("fillPrice") or fill.get("price") or fill.get("avgPrice"))
+        # exit_price — цена закрытия из fillHistory
+        exit_price = safe_float(
+            fill.get("fillPrice") or fill.get("price") or
+            fill.get("avgPrice") or fill.get("closePrice")
+        )
+        # entry_price — fillHistory не содержит, берём из allOrders по orderId
+        entry_price = safe_float(
+            fill.get("openPrice") or fill.get("avgOpenPrice") or
+            fill.get("openAvgPrice") or fill.get("entryPrice")
+        ) or open_prices.get(order_id)
         size = safe_float(fill.get("filledVolume") or fill.get("qty") or fill.get("quantity") or fill.get("amount"))
         try:
             leverage = float(str(fill.get("leverage") or "1").replace("X", "").replace("x", ""))
