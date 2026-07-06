@@ -1438,37 +1438,15 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # Получаем цены открытия и плечо через positionHistory v1
-    # Параметры: startTs/endTs (не startTime/endTime!)
+    # Дамп positionHistory — смотрим все ключи первой позиции
     position_data = {}
-    for sym in symbols:
-        try:
-            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret, {
-                "symbol": sym,
-                "startTs": start_ts,
-                "endTs": end_ts,
-                "pageIndex": 1,
-                "pageSize": 100,
-            })
-            if r.get("code") == 0:
-                d = r.get("data") or {}
-                items = d.get("positionList") or d.get("list") or (d if isinstance(d, list) else [])
-                if sym not in position_data:
-                    position_data[sym] = []
-                for p in items:
-                    entry = safe_float(p.get("avgPrice") or p.get("entryPrice") or p.get("openAvgPrice"))
-                    lev_raw = p.get("leverage")
-                    try:
-                        lev = float(str(lev_raw).replace("X","").replace("x","")) if lev_raw else None
-                    except Exception:
-                        lev = None
-                    position_data[sym].append({
-                        "avgPrice": entry,
-                        "leverage": lev,
-                        "closeTime": int(p.get("updateTime") or p.get("closeTime") or 0),
-                    })
-        except Exception:
-            continue
+    sym = list(symbols)[0] if symbols else "BTC-USDT"
+    r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret, {
+        "symbol": sym, "startTs": start_ts, "endTs": end_ts, "pageIndex": 1, "pageSize": 3,
+    })
+    d = r.get("data") or {}
+    items = d.get("positionList") or d.get("list") or (d if isinstance(d, list) else [])
+    raise HTTPException(status_code=400, detail=f"code={r.get('code')} items={len(items)} sample={str(items[0]) if items else 'EMPTY'}")
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
