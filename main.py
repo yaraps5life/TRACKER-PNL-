@@ -1377,8 +1377,8 @@ def bingx_sync(
         pass
 
     # Шаг 2: для каждого символа тянем fillHistory (реальные исполнения)
-    # fillHistory возвращает каждое закрытие позиции с точным PnL, ценами, объёмом
     all_fills = []
+    debug_log = []
     for sym in symbols:
         try:
             r = bingx_get("/openApi/swap/v2/trade/fillHistory", api_key, secret, {
@@ -1387,13 +1387,22 @@ def bingx_sync(
                 "endTime": end_ts,
                 "limit": 100,
             })
-            if r.get("code") == 0:
-                fills = r.get("data", {})
-                # fillHistory возвращает {"fill_orders": [...]} или {"data": [...]}
-                items = (fills.get("fill_orders") or fills.get("fills") or
-                         fills.get("data") or fills if isinstance(fills, list) else [])
+            code = r.get("code")
+            msg = r.get("msg", "")
+            data = r.get("data")
+            debug_log.append(f"fillHistory {sym}: code={code} msg={msg} data_type={type(data).__name__}")
+            if code == 0 and data is not None:
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = (data.get("fill_orders") or data.get("fills") or
+                             data.get("orders") or data.get("data") or [])
+                else:
+                    items = []
+                debug_log.append(f"  -> items={len(items)}")
                 all_fills.extend(items)
-        except Exception:
+        except Exception as e:
+            debug_log.append(f"fillHistory {sym}: exception={str(e)}")
             continue
 
     # Если fillHistory ничего не вернул — пробуем allFillOrders
@@ -1406,18 +1415,27 @@ def bingx_sync(
                     "endTime": end_ts,
                     "limit": 100,
                 })
-                if r.get("code") == 0:
-                    d = r.get("data", {})
-                    items = d.get("fill_orders") or d.get("orders") or d.get("data") or (d if isinstance(d, list) else [])
+                code = r.get("code")
+                msg = r.get("msg", "")
+                data = r.get("data")
+                debug_log.append(f"allFillOrders {sym}: code={code} msg={msg} data_type={type(data).__name__}")
+                if code == 0 and data is not None:
+                    if isinstance(data, list):
+                        items = data
+                    elif isinstance(data, dict):
+                        items = (data.get("fill_orders") or data.get("orders") or
+                                 data.get("data") or [])
+                    else:
+                        items = []
+                    debug_log.append(f"  -> items={len(items)}")
                     all_fills.extend(items)
-            except Exception:
+            except Exception as e:
+                debug_log.append(f"allFillOrders {sym}: exception={str(e)}")
                 continue
 
     if not all_fills:
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось получить историю сделок из BingX. Проверь права API ключа."
-        )
+        detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
+        raise HTTPException(status_code=400, detail=detail)
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
