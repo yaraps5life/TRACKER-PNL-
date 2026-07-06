@@ -1334,13 +1334,25 @@ class BingxSyncRequest(BaseModel):
     risk_usd: Optional[float] = None  # глобальный риск в $ для расчёта result_r
 
 
+def safe_float(v):
+    try:
+        result = float(v)
+        return result if result != 0 else None
+    except Exception:
+        return None
+
+
 @app.post("/exchange/bingx/sync")
 def bingx_sync(
     body: BingxSyncRequest = BingxSyncRequest(),
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Синхронизирует закрытые позиции с BingX (USDT-M)."""
+    """
+    Синхронизирует сделки с BingX через Trade/Fill History.
+    Источник: /openApi/swap/v2/trade/fillHistory — реальные исполнения с точными
+    ценами входа/выхода и PnL. Один ордер на закрытие = одна запись в журнале.
+    """
     settings = get_or_create_settings(user_id, db)
     if not settings.bingx_api_key or not settings.bingx_secret_key:
         raise HTTPException(status_code=400, detail="BingX не подключён")
@@ -1349,80 +1361,94 @@ def bingx_sync(
     secret = settings.bingx_secret_key
 
     end_ts = int(datetime.utcnow().timestamp() * 1000)
-    start_ts = end_ts - 90 * 24 * 60 * 60 * 1000
+    start_ts = end_ts - 90 * 24 * 60 * 60 * 1000  # 90 дней
 
-    # Шаг 1: получаем список символов через income
-    symbols = []
+    # Шаг 1: получаем список торгуемых символов через income
+    symbols = set()
     try:
         r = bingx_get("/openApi/swap/v2/user/income", api_key, secret,
             {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 1000})
         if r.get("code") == 0:
-            symbols = list(set(
-                item.get("symbol") for item in (r.get("data") or [])
-                if item.get("symbol")
-            ))
+            for item in (r.get("data") or []):
+                sym = item.get("symbol")
+                if sym:
+                    symbols.add(sym)
     except Exception:
         pass
 
-    # Шаг 2: для каждого символа запрашиваем positionHistory
-    all_positions = []
+    # Шаг 2: для каждого символа тянем fillHistory (реальные исполнения)
+    # fillHistory возвращает каждое закрытие позиции с точным PnL, ценами, объёмом
+    all_fills = []
     for sym in symbols:
         try:
-            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
-                {"symbol": sym, "pageIndex": 1, "pageSize": 100})
+            r = bingx_get("/openApi/swap/v2/trade/fillHistory", api_key, secret, {
+                "symbol": sym,
+                "startTime": start_ts,
+                "endTime": end_ts,
+                "limit": 100,
+            })
             if r.get("code") == 0:
-                d = r.get("data", {})
-                items = d.get("positionList") or d.get("list") or []
-                # Фильтруем по дате
-                for item in items:
-                    ts = int(item.get("updateTime") or item.get("closeTime") or 0)
-                    if ts >= start_ts:
-                        all_positions.append(item)
+                fills = r.get("data", {})
+                # fillHistory возвращает {"fill_orders": [...]} или {"data": [...]}
+                items = (fills.get("fill_orders") or fills.get("fills") or
+                         fills.get("data") or fills if isinstance(fills, list) else [])
+                all_fills.extend(items)
         except Exception:
             continue
 
-    # Шаг 3: если positionHistory пустой — используем income напрямую
-    if not all_positions:
-        try:
-            r = bingx_get("/openApi/swap/v2/user/income", api_key, secret,
-                {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 1000})
-            if r.get("code") == 0:
-                income_map = {}
-                for item in (r.get("data") or []):
-                    pnl = float(item.get("income") or 0)
-                    tid = str(item.get("tradeId") or item.get("id") or "")
-                    if not tid or pnl == 0:
-                        continue
-                    if tid in income_map:
-                        income_map[tid]["realisedPnl"] += pnl
-                    else:
-                        income_map[tid] = {
-                            "positionId": tid,
-                            "symbol": item.get("symbol", ""),
-                            "realisedPnl": pnl,
-                            "updateTime": item.get("time"),
-                        }
-                all_positions = list(income_map.values())
-        except Exception:
-            pass
+    # Если fillHistory ничего не вернул — пробуем allFillOrders
+    if not all_fills:
+        for sym in symbols:
+            try:
+                r = bingx_get("/openApi/swap/v2/trade/allFillOrders", api_key, secret, {
+                    "symbol": sym,
+                    "startTime": start_ts,
+                    "endTime": end_ts,
+                    "limit": 100,
+                })
+                if r.get("code") == 0:
+                    d = r.get("data", {})
+                    items = d.get("fill_orders") or d.get("orders") or d.get("data") or (d if isinstance(d, list) else [])
+                    all_fills.extend(items)
+            except Exception:
+                continue
 
-    if not all_positions:
-        raise HTTPException(status_code=400, detail="Не удалось получить позиции из BingX")
+    if not all_fills:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось получить историю сделок из BingX. Проверь права API ключа."
+        )
 
-    # Сортируем по дате DESC
-    all_positions.sort(
-        key=lambda p: int(p.get("updateTime") or p.get("closeTime") or 0),
+    # Сортируем по времени DESC (новые сначала)
+    all_fills.sort(
+        key=lambda f: int(f.get("time") or f.get("createTime") or f.get("updateTime") or 0),
         reverse=True
     )
 
     added = 0
     skipped = 0
 
-    for pos in all_positions:
-        order_id = str(pos.get("positionId") or pos.get("orderId") or "")
+    for fill in all_fills:
+        # Уникальный ID: orderId или filledOrderId
+        order_id = str(
+            fill.get("orderId") or fill.get("filledOrderId") or fill.get("tradeId") or ""
+        )
         if not order_id:
+            skipped += 1
             continue
 
+        # Пропускаем ордера открытия (side=BUY для LONG, side=SELL для SHORT)
+        # Нас интересуют только ордера закрытия — они имеют реализованный PnL
+        pnl_usd = safe_float(
+            fill.get("realisedPnl") or fill.get("realizedPnl") or
+            fill.get("profit") or fill.get("income") or fill.get("pnl")
+        )
+        # Пропускаем нулевые PnL (ордера открытия или частичные исполнения без закрытия)
+        if pnl_usd is None or pnl_usd == 0:
+            skipped += 1
+            continue
+
+        # Дубли
         existing = db.query(Trade).filter(
             Trade.user_id == user_id,
             Trade.source == "auto",
@@ -1432,32 +1458,41 @@ def bingx_sync(
             skipped += 1
             continue
 
-        pnl_usd = float(pos.get("realisedPnl") or pos.get("profit") or 0)
-        if pnl_usd == 0:
-            skipped += 1
-            continue
+        # Символ
+        symbol_raw = fill.get("symbol") or ""
+        symbol_clean = symbol_raw.replace("-USDT", "USDT").replace("-SWAP", "").replace("-", "")
 
-        symbol_clean = (pos.get("symbol") or "").replace("-USDT","USDT").replace("-SWAP","")
-        side = str(pos.get("positionSide") or "LONG").upper()
-        direction = "short" if "SHORT" in side else "long"
+        # Направление: positionSide (LONG/SHORT) или side (BUY=long, SELL=short)
+        pos_side = str(fill.get("positionSide") or "").upper()
+        side = str(fill.get("side") or "").upper()
+        if pos_side == "SHORT":
+            direction = "short"
+        elif pos_side == "LONG":
+            direction = "long"
+        elif side == "SELL":
+            # SELL в контексте фьючерсов = закрытие LONG или открытие SHORT
+            # Если есть realisedPnl — скорее всего закрытие, определяем по знаку
+            direction = "long"  # консервативно, чаще SELL = закрыть лонг
+        else:
+            direction = "long"
+
         outcome = "win" if pnl_usd > 0 else "loss"
 
-        def safe_float(v):
-            try: return float(v) or None
-            except: return None
-
-        entry_price = safe_float(pos.get("avgPrice") or pos.get("entryPrice"))
-        exit_price = safe_float(pos.get("closePrice") or pos.get("avgClosePrice"))
-        size = safe_float(pos.get("positionAmt") or pos.get("amount"))
+        # Цены: fillPrice / price — реальная цена исполнения
+        entry_price = safe_float(fill.get("openPrice") or fill.get("avgOpenPrice"))
+        exit_price = safe_float(fill.get("fillPrice") or fill.get("price") or fill.get("avgPrice"))
+        size = safe_float(fill.get("filledVolume") or fill.get("qty") or fill.get("quantity") or fill.get("amount"))
         try:
-            leverage = float(str(pos.get("leverage") or "1").replace("X","").replace("x",""))
-        except:
+            leverage = float(str(fill.get("leverage") or "1").replace("X", "").replace("x", ""))
+            if leverage == 0:
+                leverage = None
+        except Exception:
             leverage = None
 
-        close_ts = pos.get("updateTime") or pos.get("closeTime")
-        trade_date = datetime.utcfromtimestamp(int(close_ts)/1000) if close_ts else datetime.utcnow()
+        fill_ts = fill.get("time") or fill.get("createTime") or fill.get("updateTime")
+        trade_date = datetime.utcfromtimestamp(int(fill_ts) / 1000) if fill_ts else datetime.utcnow()
 
-        # Считаем result_r если передан глобальный риск
+        # result_r если передан глобальный риск
         result_r = None
         if body.risk_usd and body.risk_usd > 0:
             result_r = round(pnl_usd / body.risk_usd, 2)
@@ -1488,8 +1523,8 @@ def bingx_sync(
         "status": "ok",
         "added": added,
         "skipped": skipped,
-        "total_fetched": len(all_positions),
-        "symbols": symbols,
-        "debug": f"символов: {len(symbols)}, позиций: {len(all_positions)}",
+        "total_fetched": len(all_fills),
+        "symbols": list(symbols),
+        "debug": f"символов: {len(symbols)}, филлов: {len(all_fills)}",
     }
 
