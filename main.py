@@ -1438,23 +1438,37 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # Дебаг: смотрим что возвращает positionHistory
+    # Получаем цены открытия и плечо через positionHistory v1
+    # Параметры: startTs/endTs (не startTime/endTime!)
     position_data = {}
-    _pos_debug = []
-    sym = list(symbols)[0] if symbols else "BTC-USDT"
-    try:
-        r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
-            {"symbol": sym, "pageIndex": 1, "pageSize": 3})
-        _pos_debug.append(f"v1 code={r.get('code')} msg={r.get('msg')} data_keys={list((r.get('data') or {}).keys()) if isinstance(r.get('data'), dict) else type(r.get('data')).__name__} sample={str(list((r.get('data') or {}).values())[:1])[:200]}")
-    except Exception as e:
-        _pos_debug.append(f"v1 err={e}")
-    try:
-        r2 = bingx_get("/openApi/swap/v2/trade/positionHistory", api_key, secret,
-            {"symbol": sym, "pageIndex": 1, "pageSize": 3})
-        _pos_debug.append(f"v2 code={r2.get('code')} msg={r2.get('msg')} data_keys={list((r2.get('data') or {}).keys()) if isinstance(r2.get('data'), dict) else type(r2.get('data')).__name__}")
-    except Exception as e:
-        _pos_debug.append(f"v2 err={e}")
-    raise HTTPException(status_code=400, detail=" || ".join(_pos_debug))
+    for sym in symbols:
+        try:
+            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret, {
+                "symbol": sym,
+                "startTs": start_ts,
+                "endTs": end_ts,
+                "pageIndex": 1,
+                "pageSize": 100,
+            })
+            if r.get("code") == 0:
+                d = r.get("data") or {}
+                items = d.get("positionList") or d.get("list") or (d if isinstance(d, list) else [])
+                if sym not in position_data:
+                    position_data[sym] = []
+                for p in items:
+                    entry = safe_float(p.get("avgPrice") or p.get("entryPrice") or p.get("openAvgPrice"))
+                    lev_raw = p.get("leverage")
+                    try:
+                        lev = float(str(lev_raw).replace("X","").replace("x","")) if lev_raw else None
+                    except Exception:
+                        lev = None
+                    position_data[sym].append({
+                        "avgPrice": entry,
+                        "leverage": lev,
+                        "closeTime": int(p.get("updateTime") or p.get("closeTime") or 0),
+                    })
+        except Exception:
+            continue
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
