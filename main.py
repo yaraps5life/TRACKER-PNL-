@@ -1330,8 +1330,13 @@ def bingx_status(
     }
 
 
+class BingxSyncRequest(BaseModel):
+    risk_usd: Optional[float] = None  # глобальный риск в $ для расчёта result_r
+
+
 @app.post("/exchange/bingx/sync")
 def bingx_sync(
+    body: BingxSyncRequest = BingxSyncRequest(),
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
@@ -1452,12 +1457,18 @@ def bingx_sync(
         close_ts = pos.get("updateTime") or pos.get("closeTime")
         trade_date = datetime.utcfromtimestamp(int(close_ts)/1000) if close_ts else datetime.utcnow()
 
+        # Считаем result_r если передан глобальный риск
+        result_r = None
+        if body.risk_usd and body.risk_usd > 0:
+            result_r = round(pnl_usd / body.risk_usd, 2)
+
         trade = Trade(
             user_id=user_id,
             asset=order_id,
             symbol=symbol_clean,
             direction=direction,
             outcome=outcome,
+            result_r=result_r,
             pnl_usd=round(pnl_usd, 4),
             entry_price=entry_price,
             exit_price=exit_price,
