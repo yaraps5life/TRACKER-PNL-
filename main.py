@@ -1438,33 +1438,28 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # Подтягиваем цены открытия через allOrders (fillHistory их не содержит)
-    open_prices = {}
-    _allorders_sample = None
+    # fillHistory не содержит цену открытия и плечо.
+    # Получаем их через positionHistory — там есть avgPrice (вход) и leverage
+    # Строим словарь symbol -> список позиций для поиска по времени
+    position_data = {}  # symbol -> [{ avgPrice, leverage, openTime, closeTime }]
     for sym in symbols:
         try:
-            r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret, {
-                "symbol": sym,
-                "startTime": start_ts,
-                "endTime": end_ts,
-                "limit": 200,
-            })
+            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
+                {"symbol": sym, "pageIndex": 1, "pageSize": 100})
             if r.get("code") == 0:
-                orders = (r.get("data") or {})
-                if isinstance(orders, dict):
-                    orders = orders.get("orders") or []
-                orders = orders if isinstance(orders, list) else []
-                if orders and _allorders_sample is None:
-                    _allorders_sample = orders[0]
-                for o in orders:
-                    oid = str(o.get("orderId") or "")
-                    price = safe_float(o.get("avgPrice") or o.get("price"))
-                    if oid and price:
-                        open_prices[oid] = price
+                d = r.get("data") or {}
+                items = d.get("positionList") or d.get("list") or []
+                if sym not in position_data:
+                    position_data[sym] = []
+                for p in items:
+                    position_data[sym].append({
+                        "avgPrice": safe_float(p.get("avgPrice") or p.get("entryPrice")),
+                        "leverage": p.get("leverage"),
+                        "openTime": int(p.get("openTime") or p.get("createTime") or 0),
+                        "closeTime": int(p.get("updateTime") or p.get("closeTime") or 0),
+                    })
         except Exception:
             continue
-
-    raise HTTPException(status_code=400, detail=f"allOrders sample={_allorders_sample} | open_prices count={len(open_prices)} | fill_sample_keys={list(all_fills[0].keys()) if all_fills else []}")
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
@@ -1526,23 +1521,34 @@ def bingx_sync(
         outcome = "win" if pnl_usd > 0 else "loss"
 
         # Цены: fillPrice / price — реальная цена исполнения
-        # exit_price — цена закрытия из fillHistory
-        exit_price = safe_float(
-            fill.get("fillPrice") or fill.get("price") or
-            fill.get("avgPrice") or fill.get("closePrice")
-        )
-        # entry_price — fillHistory не содержит, берём из allOrders по orderId
-        entry_price = safe_float(
-            fill.get("openPrice") or fill.get("avgOpenPrice") or
-            fill.get("openAvgPrice") or fill.get("entryPrice")
-        ) or open_prices.get(order_id)
-        size = safe_float(fill.get("filledVolume") or fill.get("qty") or fill.get("quantity") or fill.get("amount"))
-        try:
-            leverage = float(str(fill.get("leverage") or "1").replace("X", "").replace("x", ""))
-            if leverage == 0:
+        # exit_price — цена исполнения из fillHistory
+        exit_price = safe_float(fill.get("price") or fill.get("fillPrice") or fill.get("avgPrice"))
+
+        # entry_price и leverage — ищем в positionHistory по символу и времени
+        entry_price = None
+        leverage = None
+        sym_positions = position_data.get(symbol_raw) or position_data.get(symbol_clean) or []
+        if sym_positions:
+            fill_ts_ms = 0
+            try:
+                from datetime import timezone
+                ft = fill.get("filledTime") or ""
+                if ft:
+                    dt = datetime.fromisoformat(str(ft).replace("Z", "+00:00"))
+                    fill_ts_ms = int(dt.astimezone(timezone.utc).timestamp() * 1000)
+            except Exception:
+                pass
+            # Берём позицию, время закрытия которой ближайшее к времени филла
+            best = min(sym_positions,
+                key=lambda p: abs(p["closeTime"] - fill_ts_ms) if p["closeTime"] else 999999999999)
+            entry_price = best.get("avgPrice")
+            lev_raw = best.get("leverage")
+            try:
+                leverage = float(str(lev_raw).replace("X","").replace("x","")) if lev_raw else None
+            except Exception:
                 leverage = None
-        except Exception:
-            leverage = None
+        size = safe_float(fill.get("quoteQty") or fill.get("filledVolume") or fill.get("qty") or fill.get("quantity"))
+        # leverage уже взят из positionHistory выше
 
         fill_ts_raw = fill.get("filledTime") or fill.get("time") or fill.get("createTime") or fill.get("updateTime")
         try:
