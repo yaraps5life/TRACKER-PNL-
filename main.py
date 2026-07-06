@@ -1399,7 +1399,7 @@ def bingx_sync(
                              data.get("fills") or data.get("orders") or data.get("data") or [])
                 else:
                     items = []
-                debug_log.append(f"  -> items={len(items)}")
+                debug_log.append(f"  -> items={len(items)} sample={str(items[0])[:300] if items else 'empty'}")
                 all_fills.extend(items)
         except Exception as e:
             debug_log.append(f"fillHistory {sym}: exception={str(e)}")
