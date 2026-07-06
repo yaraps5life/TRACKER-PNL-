@@ -1437,11 +1437,6 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # Показываем структуру первого филла для отладки
-    if all_fills:
-        sample = all_fills[0]
-        raise HTTPException(status_code=400, detail=f"SAMPLE FILL: {dict(sample)}")
-
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
         key=lambda f: int(f.get("time") or f.get("createTime") or f.get("updateTime") or 0),
@@ -1463,8 +1458,8 @@ def bingx_sync(
         # Пропускаем ордера открытия (side=BUY для LONG, side=SELL для SHORT)
         # Нас интересуют только ордера закрытия — они имеют реализованный PnL
         pnl_usd = safe_float(
-            fill.get("realisedPnl") or fill.get("realizedPnl") or
-            fill.get("profit") or fill.get("income") or fill.get("pnl")
+            fill.get("realisedPNL") or fill.get("realisedPnl") or
+            fill.get("realizedPnl") or fill.get("profit") or fill.get("pnl")
         )
         # Пропускаем нулевые PnL (ордера открытия или частичные исполнения без закрытия)
         if pnl_usd is None or pnl_usd == 0:
@@ -1512,7 +1507,7 @@ def bingx_sync(
         except Exception:
             leverage = None
 
-        fill_ts = fill.get("time") or fill.get("createTime") or fill.get("updateTime")
+        fill_ts = fill.get("filledTime") or fill.get("time") or fill.get("createTime") or fill.get("updateTime")
         trade_date = datetime.utcfromtimestamp(int(fill_ts) / 1000) if fill_ts else datetime.utcnow()
 
         # result_r если передан глобальный риск
