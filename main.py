@@ -1438,28 +1438,23 @@ def bingx_sync(
         detail = "Нет данных. " + " | ".join(debug_log) if debug_log else "symbols пустой — income вернул 0 записей"
         raise HTTPException(status_code=400, detail=detail)
 
-    # fillHistory не содержит цену открытия и плечо.
-    # Получаем их через positionHistory — там есть avgPrice (вход) и leverage
-    # Строим словарь symbol -> список позиций для поиска по времени
-    position_data = {}  # symbol -> [{ avgPrice, leverage, openTime, closeTime }]
-    for sym in symbols:
-        try:
-            r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
-                {"symbol": sym, "pageIndex": 1, "pageSize": 100})
-            if r.get("code") == 0:
-                d = r.get("data") or {}
-                items = d.get("positionList") or d.get("list") or []
-                if sym not in position_data:
-                    position_data[sym] = []
-                for p in items:
-                    position_data[sym].append({
-                        "avgPrice": safe_float(p.get("avgPrice") or p.get("entryPrice")),
-                        "leverage": p.get("leverage"),
-                        "openTime": int(p.get("openTime") or p.get("createTime") or 0),
-                        "closeTime": int(p.get("updateTime") or p.get("closeTime") or 0),
-                    })
-        except Exception:
-            continue
+    # Дебаг: смотрим что возвращает positionHistory
+    position_data = {}
+    _pos_debug = []
+    sym = list(symbols)[0] if symbols else "BTC-USDT"
+    try:
+        r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
+            {"symbol": sym, "pageIndex": 1, "pageSize": 3})
+        _pos_debug.append(f"v1 code={r.get('code')} msg={r.get('msg')} data_keys={list((r.get('data') or {}).keys()) if isinstance(r.get('data'), dict) else type(r.get('data')).__name__} sample={str(list((r.get('data') or {}).values())[:1])[:200]}")
+    except Exception as e:
+        _pos_debug.append(f"v1 err={e}")
+    try:
+        r2 = bingx_get("/openApi/swap/v2/trade/positionHistory", api_key, secret,
+            {"symbol": sym, "pageIndex": 1, "pageSize": 3})
+        _pos_debug.append(f"v2 code={r2.get('code')} msg={r2.get('msg')} data_keys={list((r2.get('data') or {}).keys()) if isinstance(r2.get('data'), dict) else type(r2.get('data')).__name__}")
+    except Exception as e:
+        _pos_debug.append(f"v2 err={e}")
+    raise HTTPException(status_code=400, detail=" || ".join(_pos_debug))
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
