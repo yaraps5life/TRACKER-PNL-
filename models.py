@@ -97,6 +97,21 @@ class ShareLink(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TradeAttachment(Base):
+    """Вложения к сделке — скриншоты графиков.
+    Хранятся как base64 строка прямо в PostgreSQL (TEXT).
+    Для журнала трейдера объём небольшой, S3 избыточен."""
+    __tablename__ = "trade_attachments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_id = Column(Integer, index=True, nullable=False)
+    user_id = Column(BigInteger, index=True, nullable=False)
+    filename = Column(String, nullable=False)
+    mime_type = Column(String, default="image/jpeg")
+    data = Column(String, nullable=False)   # base64 dataURL
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class User(Base):
     """Все пользователи которые открыли апп.
     Запись создаётся при первом входе, updated_at обновляется при каждом."""
