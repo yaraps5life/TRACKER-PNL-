@@ -1439,8 +1439,8 @@ def bingx_sync(
         raise HTTPException(status_code=400, detail=detail)
 
     # Подтягиваем цены открытия через allOrders (fillHistory их не содержит)
-    # Строим словарь orderId -> avgPrice из ордеров на открытие (side=BUY для LONG, SELL для SHORT)
     open_prices = {}
+    _allorders_sample = None
     for sym in symbols:
         try:
             r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret, {
@@ -1453,13 +1453,19 @@ def bingx_sync(
                 orders = (r.get("data") or {})
                 if isinstance(orders, dict):
                     orders = orders.get("orders") or []
-                for o in (orders if isinstance(orders, list) else []):
+                orders = orders if isinstance(orders, list) else []
+                if orders and _allorders_sample is None:
+                    _allorders_sample = orders[0]
+                for o in orders:
                     oid = str(o.get("orderId") or "")
                     price = safe_float(o.get("avgPrice") or o.get("price"))
                     if oid and price:
                         open_prices[oid] = price
         except Exception:
             continue
+
+    if _allorders_sample is not None:
+        raise HTTPException(status_code=400, detail=f"ALLORDERS SAMPLE: {dict(_allorders_sample)}")
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
