@@ -210,7 +210,10 @@ def calculate_stats(trades: list[Trade]) -> dict:
     negative_r = abs(sum(t.result_r for t in trades if t.result_r is not None and t.result_r < 0))
     profit_factor = round(positive_r / negative_r, 2) if negative_r > 0 else float(positive_r > 0)
 
-    total_r = round(sum(t.result_r or 0 for t in trades), 2)
+    total_r = round(sum(
+        t.result_r if t.result_r is not None else (t.pnl_usd or 0)
+        for t in trades
+    ), 2)
 
     streak = 0
     if trades_with_outcome:
