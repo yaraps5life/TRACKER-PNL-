@@ -1507,8 +1507,21 @@ def bingx_sync(
         except Exception:
             leverage = None
 
-        fill_ts = fill.get("filledTime") or fill.get("time") or fill.get("createTime") or fill.get("updateTime")
-        trade_date = datetime.utcfromtimestamp(int(fill_ts) / 1000) if fill_ts else datetime.utcnow()
+        fill_ts_raw = fill.get("filledTime") or fill.get("time") or fill.get("createTime") or fill.get("updateTime")
+        try:
+            if fill_ts_raw is None:
+                trade_date = datetime.utcnow()
+            elif isinstance(fill_ts_raw, (int, float)):
+                trade_date = datetime.utcfromtimestamp(int(fill_ts_raw) / 1000)
+            elif str(fill_ts_raw).isdigit():
+                trade_date = datetime.utcfromtimestamp(int(fill_ts_raw) / 1000)
+            else:
+                # ISO строка типа "2026-07-01T09:48:23.000+08:00"
+                from datetime import timezone
+                dt = datetime.fromisoformat(str(fill_ts_raw).replace("Z", "+00:00"))
+                trade_date = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            trade_date = datetime.utcnow()
 
         # result_r если передан глобальный риск
         result_r = None
