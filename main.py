@@ -1395,8 +1395,8 @@ def bingx_sync(
                 if isinstance(data, list):
                     items = data
                 elif isinstance(data, dict):
-                    items = (data.get("fill_orders") or data.get("fills") or
-                             data.get("orders") or data.get("data") or [])
+                    items = (data.get("fill_history_orders") or data.get("fill_orders") or
+                             data.get("fills") or data.get("orders") or data.get("data") or [])
                 else:
                     items = []
                 debug_log.append(f"  -> items={len(items)}")
