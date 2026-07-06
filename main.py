@@ -1464,8 +1464,7 @@ def bingx_sync(
         except Exception:
             continue
 
-    if _allorders_sample is not None:
-        raise HTTPException(status_code=400, detail=f"ALLORDERS SAMPLE: {dict(_allorders_sample)}")
+    raise HTTPException(status_code=400, detail=f"allOrders sample={_allorders_sample} | open_prices count={len(open_prices)} | fill_sample_keys={list(all_fills[0].keys()) if all_fills else []}")
 
     # Сортируем по времени DESC (новые сначала)
     all_fills.sort(
