@@ -1390,7 +1390,7 @@ def bingx_sync(
             code = r.get("code")
             msg = r.get("msg", "")
             data = r.get("data")
-            debug_log.append(f"fillHistory {sym}: code={code} msg={msg} data_type={type(data).__name__}")
+            debug_log.append(f"fillHistory {sym}: code={code} data_keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
             if code == 0 and data is not None:
                 if isinstance(data, list):
                     items = data
@@ -1418,7 +1418,7 @@ def bingx_sync(
                 code = r.get("code")
                 msg = r.get("msg", "")
                 data = r.get("data")
-                debug_log.append(f"allFillOrders {sym}: code={code} msg={msg} data_type={type(data).__name__}")
+                debug_log.append(f"allFillOrders {sym}: code={code} data_keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
                 if code == 0 and data is not None:
                     if isinstance(data, list):
                         items = data
