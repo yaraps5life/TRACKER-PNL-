@@ -44,7 +44,7 @@ from sqlalchemy import func
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Trade, UserSettings, FavoriteSymbol, ShareLink, User
+from models import Base, Trade, UserSettings, FavoriteSymbol, ShareLink, User, TradeAttachment
 from telegram_auth import validate_telegram_init_data
 
 # Создаём таблицы в базе при первом запуске (если их ещё нет)
@@ -1624,3 +1624,82 @@ def bingx_debug(
         results["positionHistory"] = {"error": str(e)}
 
     return results
+
+# ---------- Вложения к сделке (скриншоты) ----------
+
+class AttachmentIn(BaseModel):
+    filename: str
+    mime_type: str = "image/jpeg"
+    data: str  # base64 dataURL, напр. "data:image/jpeg;base64,..."
+
+
+@app.post("/trades/{trade_id}/attachments")
+def add_attachment(
+    trade_id: int,
+    body: AttachmentIn,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет скриншот к сделке."""
+    trade = db.query(Trade).filter(Trade.id == trade_id, Trade.user_id == user_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    # Лимит: не более 5 вложений на сделку
+    count = db.query(TradeAttachment).filter(
+        TradeAttachment.trade_id == trade_id,
+        TradeAttachment.user_id == user_id,
+    ).count()
+    if count >= 5:
+        raise HTTPException(status_code=400, detail="Максимум 5 скриншотов на сделку")
+
+    att = TradeAttachment(
+        trade_id=trade_id,
+        user_id=user_id,
+        filename=body.filename,
+        mime_type=body.mime_type,
+        data=body.data,
+    )
+    db.add(att)
+    db.commit()
+    db.refresh(att)
+    return {"id": att.id, "filename": att.filename, "created_at": att.created_at}
+
+
+@app.get("/trades/{trade_id}/attachments")
+def get_attachments(
+    trade_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Возвращает все скриншоты сделки."""
+    trade = db.query(Trade).filter(Trade.id == trade_id, Trade.user_id == user_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    atts = db.query(TradeAttachment).filter(
+        TradeAttachment.trade_id == trade_id,
+        TradeAttachment.user_id == user_id,
+    ).order_by(TradeAttachment.created_at).all()
+
+    return [{"id": a.id, "filename": a.filename, "data": a.data} for a in atts]
+
+
+@app.delete("/trades/{trade_id}/attachments/{att_id}")
+def delete_attachment(
+    trade_id: int,
+    att_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Удаляет скриншот."""
+    att = db.query(TradeAttachment).filter(
+        TradeAttachment.id == att_id,
+        TradeAttachment.trade_id == trade_id,
+        TradeAttachment.user_id == user_id,
+    ).first()
+    if not att:
+        raise HTTPException(status_code=404, detail="Вложение не найдено")
+    db.delete(att)
+    db.commit()
+    return {"ok": True}
