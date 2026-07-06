@@ -1528,3 +1528,68 @@ def bingx_sync(
         "debug": f"символов: {len(symbols)}, филлов: {len(all_fills)}",
     }
 
+
+@app.get("/exchange/bingx/debug")
+def bingx_debug(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Диагностика: пробует несколько эндпоинтов и возвращает raw ответы."""
+    settings = get_or_create_settings(user_id, db)
+    if not settings.bingx_api_key or not settings.bingx_secret_key:
+        raise HTTPException(status_code=400, detail="BingX не подключён")
+
+    api_key = settings.bingx_api_key
+    secret = settings.bingx_secret_key
+
+    end_ts = int(datetime.utcnow().timestamp() * 1000)
+    start_ts = end_ts - 30 * 24 * 60 * 60 * 1000  # 30 дней
+
+    results = {}
+
+    # 1. income — чтобы знать символы
+    try:
+        r = bingx_get("/openApi/swap/v2/user/income", api_key, secret,
+            {"incomeType": "REALIZED_PNL", "startTime": start_ts, "endTime": end_ts, "limit": 10})
+        results["income"] = {"code": r.get("code"), "msg": r.get("msg"), "count": len(r.get("data") or [])}
+        symbols = list(set(x.get("symbol") for x in (r.get("data") or []) if x.get("symbol")))
+        results["symbols"] = symbols[:5]
+    except Exception as e:
+        results["income"] = {"error": str(e)}
+        symbols = []
+
+    sym = symbols[0] if symbols else "BTC-USDT"
+
+    # 2. fillHistory
+    try:
+        r = bingx_get("/openApi/swap/v2/trade/fillHistory", api_key, secret,
+            {"symbol": sym, "startTime": start_ts, "endTime": end_ts, "limit": 3})
+        results["fillHistory"] = {"code": r.get("code"), "msg": r.get("msg"), "data_keys": list((r.get("data") or {}).keys()) if isinstance(r.get("data"), dict) else str(type(r.get("data"))), "sample": (r.get("data") or {}) if not isinstance(r.get("data"), list) else r.get("data", [])[:1]}
+    except Exception as e:
+        results["fillHistory"] = {"error": str(e)}
+
+    # 3. allFillOrders
+    try:
+        r = bingx_get("/openApi/swap/v2/trade/allFillOrders", api_key, secret,
+            {"symbol": sym, "startTime": start_ts, "endTime": end_ts, "limit": 3})
+        results["allFillOrders"] = {"code": r.get("code"), "msg": r.get("msg"), "data_type": str(type(r.get("data"))), "sample": r.get("data")}
+    except Exception as e:
+        results["allFillOrders"] = {"error": str(e)}
+
+    # 4. allOrders (history)
+    try:
+        r = bingx_get("/openApi/swap/v2/trade/allOrders", api_key, secret,
+            {"symbol": sym, "startTime": start_ts, "endTime": end_ts, "limit": 3})
+        results["allOrders"] = {"code": r.get("code"), "msg": r.get("msg"), "count": len((r.get("data") or {}).get("orders") or []), "sample": ((r.get("data") or {}).get("orders") or [])[:1]}
+    except Exception as e:
+        results["allOrders"] = {"error": str(e)}
+
+    # 5. positionHistory (старый)
+    try:
+        r = bingx_get("/openApi/swap/v1/trade/positionHistory", api_key, secret,
+            {"symbol": sym, "pageIndex": 1, "pageSize": 3})
+        results["positionHistory"] = {"code": r.get("code"), "msg": r.get("msg"), "data_keys": list((r.get("data") or {}).keys()) if isinstance(r.get("data"), dict) else "not dict"}
+    except Exception as e:
+        results["positionHistory"] = {"error": str(e)}
+
+    return results
